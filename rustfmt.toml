@@ -1,0 +1,3 @@
+# use defaults
+reorder_imports = true
+newline_style = "Unix"
