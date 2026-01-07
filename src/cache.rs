@@ -9,6 +9,11 @@ use std::cell::UnsafeCell;
 use std::hint::spin_loop;
 use std::ops::Deref;
 
+#[cfg(feature = "cache_stat")]
+use std::fmt::Display;
+#[cfg(feature = "cache_stat")]
+use std::sync::atomic::AtomicUsize;
+
 pub struct SpinRwLock<T> {
     state: AtomicIsize,
     data: UnsafeCell<T>,
@@ -114,6 +119,8 @@ pub trait Cache<K, V> {
 pub struct LockFreeCache<K, V> {
     entries: Cell<*mut [SpinRwLock<(K, V)>]>,
     size_exp: Cell<usize>,
+    #[cfg(feature = "cache_stat")]
+    pub stat: CacheStat,
 }
 
 impl<K: Default, V: Default> LockFreeCache<K, V> {
@@ -126,6 +133,8 @@ impl<K: Default, V: Default> LockFreeCache<K, V> {
         LockFreeCache {
             entries: Cell::new(Box::into_raw(entries)),
             size_exp: Cell::new(size_exp as usize),
+            #[cfg(feature = "cache_stat")]
+            stat: CacheStat::default(),
         }
     }
 }
@@ -138,9 +147,13 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
         let idx = hash & ((1 << self.size_exp.get()) - 1);
         let read_guard = unsafe { &*self.entries.get() }[idx as usize].read();
         if read_guard.0 == *q.borrow() {
+            #[cfg(feature = "cache_stat")]
+            self.stat.record_hit();
             return read_guard.1;
         }
 
+        #[cfg(feature = "cache_stat")]
+        self.stat.record_miss();
         V::default()
     }
 
@@ -161,6 +174,8 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
                 pair.1 = Default::default();
             });
         }
+        #[cfg(feature = "cache_stat")]
+        self.stat.record_clear();
     }
 
     fn grow(&self) {
@@ -173,5 +188,58 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
         drop(unsafe { Box::from_raw(self.entries.get()) });
         self.entries.set(Box::into_raw(new_entries));
         self.size_exp.set(new_size_exp);
+        #[cfg(feature = "cache_stat")]
+        self.stat.record_grow();
+    }
+}
+
+#[cfg(feature = "cache_stat")]
+#[derive(Default)]
+pub struct CacheStat {
+    pub clear_cnt: AtomicUsize,
+    pub grow_cnt: AtomicUsize,
+    pub last_hit: AtomicUsize, // hit count since last grow
+    pub last_miss: AtomicUsize,
+    pub unique_hit: AtomicUsize, // total hit count
+    pub unique_miss: AtomicUsize,
+}
+
+#[cfg(feature = "cache_stat")]
+impl CacheStat {
+    #[inline]
+    fn record_hit(&self) {
+        self.last_hit.fetch_add(1, Ordering::Relaxed);
+        self.unique_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_miss(&self) {
+        self.last_miss.fetch_add(1, Ordering::Relaxed);
+        self.unique_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_grow(&self) {
+        self.grow_cnt.fetch_add(1, Ordering::Relaxed);
+        self.last_hit.store(0, Ordering::Relaxed);
+        self.last_miss.store(0, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_clear(&self) {
+        self.clear_cnt.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "cache_stat")]
+impl Display for CacheStat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unique_hit = self.unique_hit.load(Ordering::Relaxed);
+        let unique_miss = self.unique_miss.load(Ordering::Relaxed);
+        write!(
+            f,
+            "unique_hit: {}, unique_miss: {}",
+            unique_hit, unique_miss
+        )
     }
 }

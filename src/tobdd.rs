@@ -1,9 +1,13 @@
-use std::{
-    cell::Cell,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::cell::Cell;
+use std::sync::atomic::Ordering;
+
+#[cfg(feature = "op_stat")]
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 use ahash::AHashMap;
+
+#[cfg(feature = "op_stat")]
+use cpu_time::ThreadTime;
 
 use crate::BddIO;
 use crate::{
@@ -13,6 +17,75 @@ use crate::{
     node::{Node, NodePtr},
     set::{LockFreeSet, Set},
 };
+
+#[cfg(feature = "op_stat")]
+#[derive(Default)]
+pub struct OpStat {
+    pub not_cnt: AtomicUsize,
+    pub not_time: AtomicU64,
+
+    pub and_cnt: AtomicUsize,
+    pub and_time: AtomicU64,
+
+    pub or_cnt: AtomicUsize,
+    pub or_time: AtomicU64,
+
+    pub comp_cnt: AtomicUsize,
+    pub comp_time: AtomicU64,
+
+    pub quant_exist_cnt: AtomicUsize,
+    pub quant_exist_time: AtomicU64,
+
+    pub quant_forall_cnt: AtomicUsize,
+    pub quant_forall_time: AtomicU64,
+
+    pub gc_cnt: AtomicUsize,
+    pub gc_time: AtomicU64,
+    pub gc_freed: AtomicUsize,
+
+    pub grow_cnt: AtomicUsize,
+    pub grow_time: AtomicU64,
+    pub grow_newed: AtomicUsize,
+}
+
+#[cfg(feature = "op_stat")]
+impl std::fmt::Display for OpStat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "NOT: (cnt: {}, time: {} us)\n",
+            self.not_cnt.load(Ordering::Relaxed),
+            self.not_time.load(Ordering::Relaxed)
+        ))?;
+        f.write_fmt(format_args!(
+            "AND: (cnt: {}, time: {} us)\n",
+            self.and_cnt.load(Ordering::Relaxed),
+            self.and_time.load(Ordering::Relaxed)
+        ))?;
+        f.write_fmt(format_args!(
+            "OR: (cnt: {}, time: {} us)\n",
+            self.or_cnt.load(Ordering::Relaxed),
+            self.or_time.load(Ordering::Relaxed)
+        ))?;
+        f.write_fmt(format_args!(
+            "COMP: (cnt: {}, time: {} us)\n",
+            self.comp_cnt.load(Ordering::Relaxed),
+            self.comp_time.load(Ordering::Relaxed)
+        ))?;
+        f.write_fmt(format_args!(
+            "GC: (cnt: {}, time: {} us, freed: {})\n",
+            self.gc_cnt.load(Ordering::Relaxed),
+            self.gc_time.load(Ordering::Relaxed),
+            self.gc_freed.load(Ordering::Relaxed)
+        ))?;
+        f.write_fmt(format_args!(
+            "GROW: (cnt: {}, time: {} us, newed: {})",
+            self.grow_cnt.load(Ordering::Relaxed),
+            self.grow_time.load(Ordering::Relaxed),
+            self.grow_newed.load(Ordering::Relaxed)
+        ))?;
+        Ok(())
+    }
+}
 
 #[allow(unused)]
 pub struct Manager {
@@ -31,6 +104,11 @@ pub struct Manager {
     comp_cache: LockFreeCache<(Bdd, Bdd), Bdd>,
     quant_exist_cache: LockFreeCache<(Bdd, Bdd), Bdd>,
     quant_forall_cache: LockFreeCache<(Bdd, Bdd), Bdd>,
+
+    #[cfg(feature = "op_stat")]
+    op_stat: OpStat,
+    #[cfg(feature = "op_stat")]
+    timer: ThreadTime,
 }
 
 impl BddManager for Manager {
@@ -68,6 +146,10 @@ impl BddManager for Manager {
             comp_cache: LockFreeCache::with_capacity(cache_size),
             quant_exist_cache: LockFreeCache::with_capacity(cache_size),
             quant_forall_cache: LockFreeCache::with_capacity(cache_size),
+            #[cfg(feature = "op_stat")]
+            op_stat: OpStat::default(),
+            #[cfg(feature = "op_stat")]
+            timer: ThreadTime::now(),
         }
     }
 
@@ -100,6 +182,15 @@ impl BddManager for Manager {
     }
 
     fn gc(&self) -> usize {
+        #[cfg(feature = "op_stat")]
+        {
+            self.op_stat.gc_cnt.fetch_add(1, Ordering::Relaxed);
+            self.op_stat
+                .gc_time
+                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        #[cfg(feature = "op_stat")]
+        let before = self.set.entry_num();
         let marked = self.set.mark_nodes();
         self.set.gc_unmarked();
         self.set.unmark_nodes();
@@ -109,6 +200,14 @@ impl BddManager for Manager {
         self.not_cache.invalidate_all();
         self.quant_exist_cache.invalidate_all();
         self.quant_forall_cache.invalidate_all();
+        #[cfg(feature = "op_stat")]
+        {
+            let freed = before.saturating_sub(marked);
+            self.op_stat.gc_freed.fetch_add(freed, Ordering::Relaxed);
+            self.op_stat
+                .gc_time
+                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         marked
     }
 }
@@ -117,22 +216,78 @@ impl BddManager for Manager {
 impl BddOp for Manager {
     fn not(&self, bdd: Bdd) -> Bdd {
         self.entor_op();
-        self._not_rec(bdd)
+        #[cfg(feature = "op_stat")]
+        {
+            self.op_stat.not_cnt.fetch_add(1, Ordering::Relaxed);
+            self.op_stat
+                .not_time
+                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let ret = self._not_rec(bdd);
+        #[cfg(feature = "op_stat")]
+        {
+            self.op_stat
+                .not_time
+                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        ret
     }
 
     fn and(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
         self.entor_op();
-        self._and_rec(lhs, rhs)
+        #[cfg(feature = "op_stat")]
+        {
+            self.op_stat.and_cnt.fetch_add(1, Ordering::Relaxed);
+            self.op_stat
+                .and_time
+                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let ret = self._and_rec(lhs, rhs);
+        #[cfg(feature = "op_stat")]
+        {
+            self.op_stat
+                .and_time
+                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        ret
     }
 
     fn or(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
         self.entor_op();
-        self._or_rec(lhs, rhs)
+        #[cfg(feature = "op_stat")]
+        {
+            self.op_stat.or_cnt.fetch_add(1, Ordering::Relaxed);
+            self.op_stat
+                .or_time
+                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let ret = self._or_rec(lhs, rhs);
+        #[cfg(feature = "op_stat")]
+        {
+            self.op_stat
+                .or_time
+                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        ret
     }
 
     fn comp(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
         self.entor_op();
-        self._comp_rec(lhs, rhs)
+        #[cfg(feature = "op_stat")]
+        {
+            self.op_stat.comp_cnt.fetch_add(1, Ordering::Relaxed);
+            self.op_stat
+                .comp_time
+                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let ret = self._comp_rec(lhs, rhs);
+        #[cfg(feature = "op_stat")]
+        {
+            self.op_stat
+                .comp_time
+                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        ret
     }
 
     fn exist(&self, bdd: Bdd, cube: Bdd) -> Bdd {
@@ -143,6 +298,41 @@ impl BddOp for Manager {
     fn forall(&self, bdd: Bdd, cube: Bdd) -> Bdd {
         self.entor_op();
         todo!()
+    }
+}
+
+impl std::fmt::Debug for Manager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "TOBDD Debug Information")?;
+        f.write_fmt(format_args!("node_num: {:?}\n", self.set.entry_num()))?;
+        f.write_fmt(format_args!("bucket_size: {:?}\n", self.set.bucket_size()))?;
+        f.write_fmt(format_args!("var_num: {:?}\n", self.num_vars))?;
+        #[cfg(feature = "cache_stat")]
+        {
+            f.write_fmt(format_args!("NOT cache stat: {}\n", self.not_cache.stat))?;
+            f.write_fmt(format_args!("AND cache stat: {}\n", self.and_cache.stat))?;
+            f.write_fmt(format_args!("OR cache stat: {}\n", self.or_cache.stat))?;
+            f.write_fmt(format_args!("COMP cache stat: {}\n", self.comp_cache.stat))?;
+            f.write_fmt(format_args!(
+                "QUANT_EXIST cache stat: {}\n",
+                self.quant_exist_cache.stat
+            ))?;
+            f.write_fmt(format_args!(
+                "QUANT_FORALL cache stat: {}\n",
+                self.quant_forall_cache.stat
+            ))?;
+        }
+        #[cfg(feature = "table_stat")]
+        {
+            let report = self.set.table_stat_report();
+            f.write_fmt(format_args!("Table stat: {}\n", report))?;
+        }
+        #[cfg(feature = "op_stat")]
+        {
+            f.write_fmt(format_args!("Op stat: {}\n", self.op_stat))?;
+        }
+        self.set.sanity_check();
+        Ok(())
     }
 }
 
@@ -433,6 +623,13 @@ impl Manager {
         if entry_num >= bucket_size * Self::MAX_LOAD_FACTOR {
             let marked = self.set.mark_nodes();
             if entry_num - marked < (bucket_size as f64 * Self::MIN_GC_RATIO) as usize {
+                #[cfg(feature = "op_stat")]
+                {
+                    self.op_stat.grow_cnt.fetch_add(1, Ordering::Relaxed);
+                    self.op_stat
+                        .grow_time
+                        .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 self.set.unmark_nodes();
                 // still exceed threshold after gc
                 self.set.grow();
@@ -442,7 +639,23 @@ impl Manager {
                 self.not_cache.grow();
                 self.quant_exist_cache.grow();
                 self.quant_forall_cache.grow();
+                #[cfg(feature = "op_stat")]
+                {
+                    let new_bucket_size = self.set.bucket_size();
+                    let newed = new_bucket_size.saturating_sub(bucket_size);
+                    self.op_stat.grow_newed.fetch_add(newed, Ordering::Relaxed);
+                    self.op_stat
+                        .grow_time
+                        .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
             } else {
+                #[cfg(feature = "op_stat")]
+                {
+                    self.op_stat.gc_cnt.fetch_add(1, Ordering::Relaxed);
+                    self.op_stat
+                        .gc_time
+                        .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 self.set.gc_unmarked();
                 self.set.unmark_nodes();
                 self.and_cache.invalidate_all();
@@ -451,6 +664,14 @@ impl Manager {
                 self.not_cache.invalidate_all();
                 self.quant_exist_cache.invalidate_all();
                 self.quant_forall_cache.invalidate_all();
+                #[cfg(feature = "op_stat")]
+                {
+                    let freed = entry_num.saturating_sub(marked);
+                    self.op_stat.gc_freed.fetch_add(freed, Ordering::Relaxed);
+                    self.op_stat
+                        .gc_time
+                        .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
             }
         }
     }

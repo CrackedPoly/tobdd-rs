@@ -2,6 +2,9 @@ use std::cell::Cell;
 use std::cmp::Ordering as CmpOrd;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+#[cfg(feature = "table_stat")]
+use std::fmt::Display;
+
 use crate::node::{Node, NodePtr};
 
 #[allow(dead_code)]
@@ -14,6 +17,97 @@ pub trait Set {
     fn gc_unmarked(&self);
     fn unmark_nodes(&self);
     fn grow(&self);
+
+    fn sanity_check(&self);
+}
+
+#[cfg(feature = "table_stat")]
+#[derive(Default)]
+pub struct TableStat {
+    pub unique_access: AtomicUsize,
+    pub unique_chain: AtomicUsize,
+    pub unique_hit: AtomicUsize,
+    pub unique_miss: AtomicUsize,
+}
+
+#[cfg(feature = "table_stat")]
+pub struct TableStatReport {
+    pub unique_access: usize,
+    pub unique_chain: usize,
+    pub unique_hit: usize,
+    pub unique_miss: usize,
+    pub table_size: usize,
+    pub node_count: usize,
+    pub load_factor: f64,
+    pub empty_buckets: usize,
+    pub non_empty_buckets: usize,
+    pub min_chain_len: usize,
+    pub max_chain_len: usize,
+    pub avg_non_empty_chain_len: f64,
+    pub histogram: [usize; 9],
+}
+
+#[cfg(feature = "table_stat")]
+impl Display for TableStat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "unique_access: {}, ",
+            self.unique_access.load(Ordering::Relaxed)
+        ))?;
+        f.write_fmt(format_args!(
+            "unique_chain: {}, ",
+            self.unique_chain.load(Ordering::Relaxed)
+        ))?;
+        f.write_fmt(format_args!(
+            "unique_hit: {}, ",
+            self.unique_hit.load(Ordering::Relaxed)
+        ))?;
+        f.write_fmt(format_args!(
+            "unique_miss: {}",
+            self.unique_miss.load(Ordering::Relaxed)
+        ))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "table_stat")]
+impl Display for TableStatReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "unique_access: {}, unique_chain: {}, unique_hit: {}, unique_miss: {}",
+            self.unique_access, self.unique_chain, self.unique_hit, self.unique_miss
+        )?;
+        writeln!(
+            f,
+            "table_size: {} buckets, node_count: {}, load_factor: {:.3}",
+            self.table_size, self.node_count, self.load_factor
+        )?;
+        writeln!(
+            f,
+            "buckets: empty: {}, non_empty: {}",
+            self.empty_buckets, self.non_empty_buckets
+        )?;
+        writeln!(
+            f,
+            "chain_len: min: {}, max: {}, avg_non_empty: {:.3}",
+            self.min_chain_len, self.max_chain_len, self.avg_non_empty_chain_len
+        )?;
+        write!(
+            f,
+            "histogram: 0: {}, 1: {}, 2-3: {}, 4-7: {}, 8-15: {}, 16-31: {}, 32-63: {}, 64-127: {}, 128+: {}",
+            self.histogram[0],
+            self.histogram[1],
+            self.histogram[2],
+            self.histogram[3],
+            self.histogram[4],
+            self.histogram[5],
+            self.histogram[6],
+            self.histogram[7],
+            self.histogram[8]
+        )?;
+        Ok(())
+    }
 }
 
 pub struct LockFreeSet {
@@ -21,6 +115,8 @@ pub struct LockFreeSet {
     size_exp: Cell<usize>,
     num_marks: Cell<usize>,
     num_entry: AtomicUsize,
+    #[cfg(feature = "table_stat")]
+    pub stat: TableStat,
 }
 
 impl LockFreeSet {
@@ -35,6 +131,8 @@ impl LockFreeSet {
             size_exp: Cell::new(size_exp as usize),
             num_marks: Cell::new(0),
             num_entry: AtomicUsize::new(0),
+            #[cfg(feature = "table_stat")]
+            stat: TableStat::default(),
         }
     }
 
@@ -68,6 +166,87 @@ impl LockFreeSet {
             self.mark_rec(high, counter);
         }
     }
+
+    #[cfg(feature = "table_stat")]
+    pub fn table_stat_report(&self) -> TableStatReport {
+        let size_exp = self.size_exp.get();
+        let table_size = 1usize << size_exp;
+        let buckets = unsafe { &*self.buckets.get() };
+        let mut histogram = [0usize; 9];
+        let mut empty_buckets = 0usize;
+        let mut non_empty_buckets = 0usize;
+        let mut min_chain_len = usize::MAX;
+        let mut max_chain_len = 0usize;
+        let mut node_count = 0usize;
+
+        for i in 0..table_size {
+            let mut len = 0usize;
+            let mut curr = buckets[i].load(Ordering::Relaxed);
+            while !curr.is_null() {
+                len += 1;
+                curr = unsafe { (*curr).next.load(Ordering::Relaxed) };
+            }
+
+            node_count += len;
+
+            if len == 0 {
+                empty_buckets += 1;
+                histogram[0] += 1;
+                continue;
+            }
+
+            non_empty_buckets += 1;
+            if len < min_chain_len {
+                min_chain_len = len;
+            }
+            if len > max_chain_len {
+                max_chain_len = len;
+            }
+
+            match len {
+                1 => histogram[1] += 1,
+                2..=3 => histogram[2] += 1,
+                4..=7 => histogram[3] += 1,
+                8..=15 => histogram[4] += 1,
+                16..=31 => histogram[5] += 1,
+                32..=63 => histogram[6] += 1,
+                64..=127 => histogram[7] += 1,
+                _ => histogram[8] += 1,
+            }
+        }
+
+        if non_empty_buckets == 0 {
+            min_chain_len = 0;
+        }
+
+        let load_factor = if table_size > 0 {
+            node_count as f64 / table_size as f64
+        } else {
+            0.0
+        };
+
+        let avg_non_empty_chain_len = if non_empty_buckets > 0 {
+            node_count as f64 / non_empty_buckets as f64
+        } else {
+            0.0
+        };
+
+        TableStatReport {
+            unique_access: self.stat.unique_access.load(Ordering::Relaxed),
+            unique_chain: self.stat.unique_chain.load(Ordering::Relaxed),
+            unique_hit: self.stat.unique_hit.load(Ordering::Relaxed),
+            unique_miss: self.stat.unique_miss.load(Ordering::Relaxed),
+            table_size,
+            node_count,
+            load_factor,
+            empty_buckets,
+            non_empty_buckets,
+            min_chain_len,
+            max_chain_len,
+            avg_non_empty_chain_len,
+            histogram,
+        }
+    }
 }
 
 impl Set for LockFreeSet {
@@ -76,6 +255,8 @@ impl Set for LockFreeSet {
     // ptr 指向的节点是有效的、且当前不在链表中；
     // 用 (level, low, high) 作为“值相等”的判定，并按这个 key 升序插入（保证并发下不会插入重复值：第二个线程 CAS 失败后会重试并看到已存在节点）。
     fn get_or_insert(&self, new_ptr: *mut Node) -> (*mut Node, bool) {
+        #[cfg(feature = "table_stat")]
+        self.stat.unique_access.fetch_add(1, Ordering::Relaxed);
         let idx = new_ptr.node_hash() & ((1 << self.size_exp.get()) - 1);
         let head = &(unsafe { &*self.buckets.get() })[idx as usize];
 
@@ -95,6 +276,8 @@ impl Set for LockFreeSet {
                 match curr_key.cmp(&new_key) {
                     CmpOrd::Equal => {
                         // 找到相同值：不插入，返回已存在节点
+                        #[cfg(feature = "table_stat")]
+                        self.stat.unique_hit.fetch_add(1, Ordering::Relaxed);
                         return (curr, false);
                     }
                     CmpOrd::Greater => {
@@ -103,6 +286,8 @@ impl Set for LockFreeSet {
                     }
                     CmpOrd::Less => {
                         // 继续向后走
+                        #[cfg(feature = "table_stat")]
+                        self.stat.unique_chain.fetch_add(1, Ordering::Relaxed);
                         prev = &curr_ref.next;
                         curr = prev.load(Ordering::Acquire) as _;
                     }
@@ -125,6 +310,8 @@ impl Set for LockFreeSet {
                 Ok(_) => {
                     // 插入成功
                     self.num_entry.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "table_stat")]
+                    self.stat.unique_miss.fetch_add(1, Ordering::Relaxed);
                     return (new_ptr, true);
                 }
                 Err(_actual_now) => {
@@ -195,7 +382,7 @@ impl Set for LockFreeSet {
                 curr = curr_ref.next.load(Ordering::Relaxed);
             }
         }
-        assert!(counter <= (2 << self.size_exp.get()));
+        debug_assert!(counter <= (2 << self.size_exp.get()));
         self.num_marks.set(counter);
         counter
     }
@@ -240,6 +427,31 @@ impl Set for LockFreeSet {
                         (*curr).level &= !Self::MARK;
                     }
                 }
+                curr = curr_ref.next.load(Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn sanity_check(&self) {
+        // check that every entry is correctly placed in the bucket
+        // check that every bucket is sorted
+        // check that there is no duplicate entry
+        for i in 0..(1 << self.size_exp.get()) {
+            let head = unsafe { &*self.buckets.get() }[i].load(Ordering::Relaxed);
+            let mut curr = head;
+            let mut prev_key: Option<(usize, *mut Node)> = None;
+            while !curr.is_null() {
+                let curr_ref = unsafe { &*curr };
+                let curr_key = curr_ref.key();
+                let idx = curr.node_hash() & ((1 << self.size_exp.get()) - 1);
+                assert_eq!(idx as usize, i, "Node in wrong bucket");
+                if let Some((prev_level, prev_ptr)) = prev_key {
+                    assert!(
+                        curr_key > unsafe { &*prev_ptr }.key(),
+                        "Bucket not sorted or duplicate entry"
+                    );
+                }
+                prev_key = Some((curr_ref.level, curr));
                 curr = curr_ref.next.load(Ordering::Relaxed);
             }
         }
