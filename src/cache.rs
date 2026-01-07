@@ -1,10 +1,9 @@
 use std::{
     borrow::Borrow,
+    cell::Cell,
     hash::Hash,
     sync::atomic::{AtomicIsize, Ordering},
 };
-
-use crate::node::Idx;
 
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
@@ -106,14 +105,18 @@ pub trait Cache<K, V> {
         Q: Borrow<K> + Hash;
 
     fn insert(&self, hash: u64, key: K, value: V) -> bool;
+
+    fn invalidate_all(&self);
+
+    fn grow(&self);
 }
 
 pub struct LockFreeCache<K, V> {
-    entries: Box<[SpinRwLock<(K, V)>]>,
-    size_exp: usize,
+    entries: Cell<*mut [SpinRwLock<(K, V)>]>,
+    size_exp: Cell<usize>,
 }
 
-impl<K: Default, V: Idx> LockFreeCache<K, V> {
+impl<K: Default, V: Default> LockFreeCache<K, V> {
     pub fn with_capacity(cap: usize) -> Self {
         let size_exp = cap.isolate_highest_one().trailing_zeros() + 1;
         let entries = (0..(1 << size_exp))
@@ -121,33 +124,54 @@ impl<K: Default, V: Idx> LockFreeCache<K, V> {
             .collect::<Vec<SpinRwLock<(K, V)>>>()
             .into_boxed_slice();
         LockFreeCache {
-            entries,
-            size_exp: size_exp as usize,
+            entries: Cell::new(Box::into_raw(entries)),
+            size_exp: Cell::new(size_exp as usize),
         }
     }
 }
 
-impl<K: Hash + Eq, V: Idx> Cache<K, V> for LockFreeCache<K, V> {
+impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K, V> {
     fn get<Q>(&self, hash: u64, q: &Q) -> V
     where
         Q: Borrow<K> + Hash,
     {
-        let idx = hash & ((1 << self.size_exp) - 1);
-        let read_guard = self.entries[idx as usize].read();
+        let idx = hash & ((1 << self.size_exp.get()) - 1);
+        let read_guard = unsafe { &*self.entries.get() }[idx as usize].read();
         if read_guard.0 == *q.borrow() {
             return read_guard.1;
         }
 
-        V::NULL
+        V::default()
     }
 
     fn insert(&self, hash: u64, key: K, value: V) -> bool {
-        let idx = hash & ((1 << self.size_exp) - 1);
-        let lock = &self.entries[idx as usize];
+        let idx = hash & ((1 << self.size_exp.get()) - 1);
+        let lock = &(unsafe { &*self.entries.get() }[idx as usize]);
         // no thread is reading, it write
         lock.try_write_once(|pair| {
             pair.0 = key;
             pair.1 = value;
         })
+    }
+
+    fn invalidate_all(&self) {
+        for entry in (unsafe { &*self.entries.get() }).iter() {
+            let _ = entry.try_write_once(|pair| {
+                pair.0 = Default::default();
+                pair.1 = Default::default();
+            });
+        }
+    }
+
+    fn grow(&self) {
+        // double the size
+        let new_size_exp = self.size_exp.get() + 1;
+        let new_entries = (0..(1 << new_size_exp))
+            .map(|_| SpinRwLock::new(Default::default()))
+            .collect::<Vec<SpinRwLock<(K, V)>>>()
+            .into_boxed_slice();
+        drop(unsafe { Box::from_raw(self.entries.get()) });
+        self.entries.set(Box::into_raw(new_entries));
+        self.size_exp.set(new_size_exp);
     }
 }

@@ -1,86 +1,64 @@
 use std::{
     cell::Cell,
-    hash::BuildHasherDefault,
-    ops::DerefMut,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ahash::{AHashMap, AHasher};
+use ahash::AHashMap;
 
+use crate::BddIO;
 use crate::{
-    BddIO, BddManager, BddOp, IoRead, IoWrite, PrintSet,
-    alloc::Allocator,
+    Bdd, BddManager, BddOp, IoRead, IoWrite, PrintSet,
     cache::{Cache, LockFreeCache},
     hash,
-    node::{Idx, Node, NodePtr},
+    node::{Node, NodePtr},
     set::{LockFreeSet, Set},
 };
 
 #[allow(unused)]
-pub struct Manager<I: Idx, A: Allocator<I>> {
-    alloc: Box<A>,
-    set: LockFreeSet<I, A>,
+pub struct Manager {
+    set: LockFreeSet,
 
     num_vars: usize,
-    num_nodes: AtomicUsize,
 
-    true_id: I,
-    false_id: I,
-    vars: Vec<I>,
-    nvars: Vec<I>,
+    true_id: Bdd,
+    false_id: Bdd,
+    vars: Vec<Bdd>,
+    nvars: Vec<Bdd>,
 
-    not_cache: LockFreeCache<I, I>,
-    and_cache: LockFreeCache<(I, I), I>,
-    or_cache: LockFreeCache<(I, I), I>,
-    comp_cache: LockFreeCache<(I, I), I>,
-    quant_exist_cache: LockFreeCache<(I, I), I>,
-    quant_forall_cache: LockFreeCache<(I, I), I>,
+    not_cache: LockFreeCache<Bdd, Bdd>,
+    and_cache: LockFreeCache<(Bdd, Bdd), Bdd>,
+    or_cache: LockFreeCache<(Bdd, Bdd), Bdd>,
+    comp_cache: LockFreeCache<(Bdd, Bdd), Bdd>,
+    quant_exist_cache: LockFreeCache<(Bdd, Bdd), Bdd>,
+    quant_forall_cache: LockFreeCache<(Bdd, Bdd), Bdd>,
 }
 
-impl<A: Allocator<usize>> BddManager<usize> for Manager<usize, A> {
+impl BddManager for Manager {
     fn init(table_size: usize, cache_size: usize, var_num: usize) -> Self {
-        let alloc = Box::new(A::default());
         let set = LockFreeSet::with_capacity(table_size);
 
-        let true_id = alloc.alloc(Node::from(0, usize::MAX - 1, usize::MAX));
-        set.get_or_insert(
-            hash::splitmix64_3(0, (usize::MAX - 1) as u64, usize::MAX as u64),
-            NodePtr::from(true_id, *alloc),
-        );
-        alloc.index(true_id).ref_cnt.fetch_add(1, Ordering::Relaxed);
-        let false_id = alloc.alloc(Node::from(0, usize::MAX, usize::MAX - 1));
-        set.get_or_insert(
-            hash::splitmix64_3(0, usize::MAX as u64, (usize::MAX - 1) as u64),
-            NodePtr::from(false_id, *alloc),
-        );
-        alloc
-            .index(false_id)
-            .ref_cnt
-            .fetch_add(1, Ordering::Relaxed);
+        let true_id = Box::into_raw(Box::new(Node::new(1)));
+        set.get_or_insert(true_id);
+        true_id.ref_cnt().fetch_add(1, Ordering::Relaxed);
+        let false_id = Box::into_raw(Box::new(Node::new(0)));
+        set.get_or_insert(false_id);
+        false_id.ref_cnt().fetch_add(1, Ordering::Relaxed);
         let mut vars = Vec::with_capacity(var_num);
         let mut nvars = Vec::with_capacity(var_num);
         for i in 0..var_num {
-            let var_id = alloc.alloc(Node::from(i, false_id, true_id));
-            let nvar_id = alloc.alloc(Node::from(i, true_id, false_id));
-            set.get_or_insert(
-                hash::splitmix64_3(i as u64, false_id as u64, true_id as u64),
-                NodePtr::from(var_id, *alloc),
-            );
-            set.get_or_insert(
-                hash::splitmix64_3(i as u64, true_id as u64, false_id as u64),
-                NodePtr::from(nvar_id, *alloc),
-            );
-            alloc.index(var_id).ref_cnt.fetch_add(1, Ordering::Relaxed);
-            alloc.index(nvar_id).ref_cnt.fetch_add(1, Ordering::Relaxed);
+            let var_id = Box::into_raw(Box::new(Node::from(i, false_id, true_id)));
+            let nvar_id = Box::into_raw(Box::new(Node::from(i, true_id, false_id)));
+            set.get_or_insert(var_id);
+            set.get_or_insert(nvar_id);
+            var_id.ref_cnt().fetch_add(1, Ordering::Relaxed);
+            nvar_id.ref_cnt().fetch_add(1, Ordering::Relaxed);
             vars.push(var_id);
             nvars.push(nvar_id);
         }
         Manager {
-            alloc,
             set,
             true_id,
             false_id,
-            num_nodes: AtomicUsize::new(2),
             num_vars: var_num,
             vars,
             nvars,
@@ -93,103 +71,112 @@ impl<A: Allocator<usize>> BddManager<usize> for Manager<usize, A> {
         }
     }
 
-    fn get_var(&self, var: usize) -> usize {
+    fn get_var(&self, var: usize) -> Bdd {
         self.vars[var]
     }
 
-    fn get_nvar(&self, var: usize) -> usize {
+    fn get_nvar(&self, var: usize) -> Bdd {
         self.nvars[var]
     }
 
-    fn get_true(&self) -> usize {
+    fn get_true(&self) -> Bdd {
         self.true_id
     }
 
-    fn get_false(&self) -> usize {
+    fn get_false(&self) -> Bdd {
         self.false_id
     }
 
     fn get_node_num(&self) -> usize {
-        self.num_nodes.load(Ordering::Relaxed)
+        self.set.entry_num()
     }
 
-    fn ref_bdd(&self, bdd: usize) {
-        self.alloc
-            .index(bdd)
-            .ref_cnt
-            .fetch_add(1, Ordering::Relaxed);
+    fn ref_bdd(&self, bdd: Bdd) {
+        bdd.ref_cnt().fetch_add(1, Ordering::Relaxed);
     }
 
-    fn deref_bdd(&self, bdd: usize) {
-        self.alloc
-            .index(bdd)
-            .ref_cnt
-            .fetch_sub(1, Ordering::Relaxed);
+    fn deref_bdd(&self, bdd: Bdd) {
+        bdd.ref_cnt().fetch_sub(1, Ordering::Relaxed);
     }
 
     fn gc(&self) -> usize {
-        todo!()
+        let marked = self.set.mark_nodes();
+        self.set.gc_unmarked();
+        self.set.unmark_nodes();
+        self.and_cache.invalidate_all();
+        self.or_cache.invalidate_all();
+        self.comp_cache.invalidate_all();
+        self.not_cache.invalidate_all();
+        self.quant_exist_cache.invalidate_all();
+        self.quant_forall_cache.invalidate_all();
+        marked
     }
 }
 
 #[allow(unused)]
-impl<A: Allocator<usize>> BddOp<usize> for Manager<usize, A> {
-    fn not(&self, bdd: usize) -> usize {
+impl BddOp for Manager {
+    fn not(&self, bdd: Bdd) -> Bdd {
+        self.entor_op();
         self._not_rec(bdd)
     }
 
-    fn and(&self, lhs: usize, rhs: usize) -> usize {
+    fn and(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
+        self.entor_op();
         self._and_rec(lhs, rhs)
     }
 
-    fn or(&self, lhs: usize, rhs: usize) -> usize {
+    fn or(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
+        self.entor_op();
         self._or_rec(lhs, rhs)
     }
 
-    fn comp(&self, lhs: usize, rhs: usize) -> usize {
+    fn comp(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
+        self.entor_op();
         self._comp_rec(lhs, rhs)
     }
 
-    fn exist(&self, bdd: usize, cube: usize) -> usize {
+    fn exist(&self, bdd: Bdd, cube: Bdd) -> Bdd {
+        self.entor_op();
         todo!()
     }
 
-    fn forall(&self, bdd: usize, cube: usize) -> usize {
+    fn forall(&self, bdd: Bdd, cube: Bdd) -> Bdd {
+        self.entor_op();
         todo!()
     }
 }
 
-impl<A: Allocator<usize>, W: IoWrite, R: IoRead> BddIO<usize, W, R> for Manager<usize, A> {
-    fn serialize(&self, bdd: usize, writer: &mut W) -> std::io::Result<()> {
-        fn write_buffer_rec<W: IoWrite, A: Allocator<usize>>(
-            manager: &Manager<usize, A>,
-            bdd: usize,
-            writer: &mut W,
-        ) {
+impl<W: IoWrite, R: IoRead> BddIO<W, R> for Manager {
+    fn serialize(&self, bdd: Bdd, writer: &mut W) -> std::io::Result<()> {
+        fn write_buffer_rec<W: IoWrite>(manager: &Manager, mut bdd: Bdd, writer: &mut W) {
             if bdd == manager.true_id || bdd == manager.false_id {
                 return;
             }
-            write_buffer_rec(manager, manager.low(bdd), writer);
-            write_buffer_rec(manager, manager.high(bdd), writer);
-            writer.write_all(&bdd.to_be_bytes()).unwrap();
-            writer.write_all(&manager.level(bdd).to_be_bytes()).unwrap();
-            writer.write_all(&manager.low(bdd).to_be_bytes()).unwrap();
-            writer.write_all(&manager.high(bdd).to_be_bytes()).unwrap();
+            write_buffer_rec(manager, *bdd.low(), writer);
+            write_buffer_rec(manager, *bdd.high(), writer);
+            writer.write_all(&(bdd as usize).to_be_bytes()).unwrap();
+            writer.write_all(&(*bdd.level()).to_be_bytes()).unwrap();
+            writer
+                .write_all(&(*bdd.low() as usize).to_be_bytes())
+                .unwrap();
+            writer
+                .write_all(&(*bdd.high() as usize).to_be_bytes())
+                .unwrap();
         }
 
         for bdd in [self.false_id, self.true_id] {
-            writer.write_all(&bdd.to_be_bytes())?;
+            writer.write_all(&(bdd as usize).to_be_bytes())?;
         }
         write_buffer_rec(self, bdd, writer);
         writer.flush()?;
         Ok(())
     }
 
-    fn deserialize(&self, reader: &mut R) -> std::io::Result<usize> {
-        let mut map: AHashMap<usize, usize> = AHashMap::default();
+    fn deserialize(&self, reader: &mut R) -> std::io::Result<Bdd> {
+        let mut map: AHashMap<usize, Bdd> = AHashMap::default();
         #[allow(unused_assignments)]
         let (mut bdd, mut level, mut low, mut high, mut ret) =
-            (0usize, 0usize, 0usize, 0usize, 0usize);
+            (0usize, 0usize, 0usize, 0usize, std::ptr::null_mut());
         let mut window = [0u8; 32];
         reader.read_exact(&mut window[0..16])?;
         let false_id = usize::from_be_bytes(window[0..8].try_into().unwrap());
@@ -215,13 +202,13 @@ impl<A: Allocator<usize>, W: IoWrite, R: IoRead> BddIO<usize, W, R> for Manager<
     }
 }
 
-impl<A: Allocator<usize>, W: IoWrite> PrintSet<usize, W> for Manager<usize, A> {
-    fn print(&self, bdd: usize, f: &mut W) -> std::io::Result<()> {
-        fn fmt_rec<W: IoWrite, A: Allocator<usize>>(
-            manager: &Manager<usize, A>,
+impl<W: IoWrite> PrintSet<W> for Manager {
+    fn print(&self, bdd: Bdd, f: &mut W) -> std::io::Result<()> {
+        fn fmt_rec<W: IoWrite>(
+            manager: &Manager,
             f: &mut W,
             chars: &mut Vec<char>,
-            bdd: usize,
+            mut bdd: Bdd,
             curr: usize,
         ) -> std::io::Result<()> {
             if curr == manager.num_vars {
@@ -231,14 +218,14 @@ impl<A: Allocator<usize>, W: IoWrite> PrintSet<usize, W> for Manager<usize, A> {
                 f.write_fmt(format_args!("\n"))?;
                 return Ok(());
             }
-            let level = manager.level(bdd);
-            if level > curr || bdd == manager.true_id {
+            let level = bdd.level();
+            if *level > curr || bdd == manager.true_id {
                 chars[curr] = '*';
                 fmt_rec(manager, f, chars, bdd, curr + 1)?;
                 return Ok(());
             }
-            let low = manager.low(bdd);
-            let high = manager.high(bdd);
+            let low = *bdd.low();
+            let high = *bdd.high();
             if low != manager.false_id {
                 chars[curr] = '0';
                 fmt_rec(manager, f, chars, low, curr + 1)?;
@@ -263,64 +250,39 @@ impl<A: Allocator<usize>, W: IoWrite> PrintSet<usize, W> for Manager<usize, A> {
 }
 
 thread_local! {
-    static FREE_ID: Cell<usize> = const {Cell::new(usize::NULL)};
+    static FREE_ID: Cell<Bdd> = const {Cell::new(std::ptr::null_mut())};
 }
 
-impl<A: Allocator<usize>> Manager<usize, A> {
-    #[inline]
-    fn index_mut(&self, bdd: usize) -> impl DerefMut<Target = Node<usize, A>> {
-        self.alloc.index_mut(bdd)
-    }
-
-    #[inline]
-    fn level(&self, bdd: usize) -> usize {
-        self.alloc.index(bdd).level
-    }
-
-    #[inline]
-    fn low(&self, bdd: usize) -> usize {
-        self.alloc.index(bdd).low
-    }
-
-    #[inline]
-    fn high(&self, bdd: usize) -> usize {
-        self.alloc.index(bdd).high
-    }
-
-    fn make_node(&self, level: usize, low: usize, high: usize) -> usize {
+impl Manager {
+    fn make_node(&self, level: usize, low: Bdd, high: Bdd) -> Bdd {
         if low == high {
             return low;
         }
 
         FREE_ID.with(|cell| {
-            let mut idx = cell.get();
-            if idx == usize::NULL {
-                idx = self.alloc.alloc(Node::from(0, 0, 0));
-                cell.set(idx);
+            let mut ptr = cell.get();
+            if ptr.is_null() {
+                ptr = Box::into_raw(Box::new(Node::new(0)));
+                cell.set(ptr);
             }
 
-            self.index_mut(idx).level = level;
-            self.index_mut(idx).low = low;
-            self.index_mut(idx).high = high;
+            *ptr.level() = level;
+            *ptr.low() = low;
+            *ptr.high() = high;
+            ptr.rehash();
 
-            let nref = NodePtr::from(idx, *self.alloc);
-
-            let (present, inserted) = self.set.get_or_insert(
-                hash::splitmix64_3(level as u64, low as u64, high as u64),
-                nref,
-            );
+            let (present, inserted) = self.set.get_or_insert(ptr);
             if !inserted {
                 // we have not use the FREE_ID
                 present
             } else {
-                self.num_nodes.fetch_add(1, Ordering::Relaxed);
-                cell.set(self.alloc.alloc(Node::from(0, 0, 0)));
-                idx
+                cell.set(Box::into_raw(Box::new(Node::new(0))));
+                ptr
             }
         })
     }
 
-    fn _not_rec(&self, bdd: usize) -> usize {
+    fn _not_rec(&self, mut bdd: Bdd) -> Bdd {
         if bdd == self.true_id {
             return self.false_id;
         }
@@ -329,18 +291,18 @@ impl<A: Allocator<usize>> Manager<usize, A> {
         }
         let hash: u64 = hash::splitmix64(bdd as u64);
         let cached = self.not_cache.get(hash, &bdd);
-        if cached != usize::NULL {
+        if !cached.is_null() {
             return cached;
         }
-        let f_low = self._not_rec(self.low(bdd));
-        let f_high = self._not_rec(self.high(bdd));
-        let res = self.make_node(self.level(bdd), f_low, f_high);
+        let f_low = self._not_rec(*bdd.low());
+        let f_high = self._not_rec(*bdd.high());
+        let res = self.make_node(*bdd.level(), f_low, f_high);
         self.not_cache.insert(hash, bdd, res);
         res
     }
 
     #[inline]
-    fn _and_rec(&self, mut lhs: usize, mut rhs: usize) -> usize {
+    fn _and_rec(&self, mut lhs: Bdd, mut rhs: Bdd) -> Bdd {
         // sort lhs, rhs without "if"
         (lhs, rhs) = (
             [lhs, rhs][(lhs >= rhs) as usize],
@@ -357,24 +319,24 @@ impl<A: Allocator<usize>> Manager<usize, A> {
         }
         let hash = hash::splitmix64_2(lhs as u64, rhs as u64);
         let bdd = self.and_cache.get(hash, &(lhs, rhs));
-        if bdd != usize::NULL {
+        if !bdd.is_null() {
             return bdd;
         }
-        let res = match self.level(lhs).cmp(&self.level(rhs)) {
+        let res = match (*lhs.level()).cmp(rhs.level()) {
             std::cmp::Ordering::Less => {
-                let f_low = self._and_rec(self.low(lhs), rhs);
-                let f_high = self._and_rec(self.high(lhs), rhs);
-                self.make_node(self.level(lhs), f_low, f_high)
+                let f_low = self._and_rec(*lhs.low(), rhs);
+                let f_high = self._and_rec(*lhs.high(), rhs);
+                self.make_node(*lhs.level(), f_low, f_high)
             }
             std::cmp::Ordering::Greater => {
-                let f_low = self._and_rec(lhs, self.low(rhs));
-                let f_high = self._and_rec(lhs, self.high(rhs));
-                self.make_node(self.level(rhs), f_low, f_high)
+                let f_low = self._and_rec(lhs, *rhs.low());
+                let f_high = self._and_rec(lhs, *rhs.high());
+                self.make_node(*rhs.level(), f_low, f_high)
             }
             std::cmp::Ordering::Equal => {
-                let f_low = self._and_rec(self.low(lhs), self.low(rhs));
-                let f_high = self._and_rec(self.high(lhs), self.high(rhs));
-                self.make_node(self.level(lhs), f_low, f_high)
+                let f_low = self._and_rec(*lhs.low(), *rhs.low());
+                let f_high = self._and_rec(*lhs.high(), *rhs.high());
+                self.make_node(*lhs.level(), f_low, f_high)
             }
         };
         self.and_cache.insert(hash, (lhs, rhs), res);
@@ -382,7 +344,7 @@ impl<A: Allocator<usize>> Manager<usize, A> {
     }
 
     #[inline]
-    fn _or_rec(&self, mut lhs: usize, mut rhs: usize) -> usize {
+    fn _or_rec(&self, mut lhs: Bdd, mut rhs: Bdd) -> Bdd {
         // sort lhs, rhs without "if"
         (lhs, rhs) = (
             [lhs, rhs][(lhs >= rhs) as usize],
@@ -399,24 +361,24 @@ impl<A: Allocator<usize>> Manager<usize, A> {
         }
         let hash = hash::splitmix64_2(lhs as u64, rhs as u64);
         let bdd = self.or_cache.get(hash, &(lhs, rhs));
-        if bdd != usize::NULL {
+        if !bdd.is_null() {
             return bdd;
         }
-        let res = match self.level(lhs).cmp(&self.level(rhs)) {
+        let res = match (*lhs.level()).cmp(rhs.level()) {
             std::cmp::Ordering::Less => {
-                let f_low = self._or_rec(self.low(lhs), rhs);
-                let f_high = self._or_rec(self.high(lhs), rhs);
-                self.make_node(self.level(lhs), f_low, f_high)
+                let f_low = self._or_rec(*lhs.low(), rhs);
+                let f_high = self._or_rec(*lhs.high(), rhs);
+                self.make_node(*lhs.level(), f_low, f_high)
             }
             std::cmp::Ordering::Greater => {
-                let f_low = self._or_rec(lhs, self.low(rhs));
-                let f_high = self._or_rec(lhs, self.high(rhs));
-                self.make_node(self.level(rhs), f_low, f_high)
+                let f_low = self._or_rec(lhs, *rhs.low());
+                let f_high = self._or_rec(lhs, *rhs.high());
+                self.make_node(*rhs.level(), f_low, f_high)
             }
             std::cmp::Ordering::Equal => {
-                let f_low = self._or_rec(self.low(lhs), self.low(rhs));
-                let f_high = self._or_rec(self.high(lhs), self.high(rhs));
-                self.make_node(self.level(lhs), f_low, f_high)
+                let f_low = self._or_rec(*lhs.low(), *rhs.low());
+                let f_high = self._or_rec(*lhs.high(), *rhs.high());
+                self.make_node(*lhs.level(), f_low, f_high)
             }
         };
         self.or_cache.insert(hash, (lhs, rhs), res);
@@ -424,7 +386,7 @@ impl<A: Allocator<usize>> Manager<usize, A> {
     }
 
     #[inline]
-    fn _comp_rec(&self, lhs: usize, rhs: usize) -> usize {
+    fn _comp_rec(&self, mut lhs: Bdd, mut rhs: Bdd) -> Bdd {
         if lhs == rhs || lhs == self.false_id || rhs == self.true_id {
             return self.false_id;
         }
@@ -436,28 +398,61 @@ impl<A: Allocator<usize>> Manager<usize, A> {
         }
         let hash = hash::splitmix64_2(lhs as u64, rhs as u64);
         let bdd = self.comp_cache.get(hash, &(lhs, rhs));
-        if bdd != usize::NULL {
+        if !bdd.is_null() {
             return bdd;
         }
-        let res = match self.level(lhs).cmp(&self.level(rhs)) {
+        let res = match (*lhs.level()).cmp(rhs.level()) {
             std::cmp::Ordering::Less => {
-                let f_low = self._comp_rec(self.low(lhs), rhs);
-                let f_high = self._comp_rec(self.high(lhs), rhs);
-                self.make_node(self.level(lhs), f_low, f_high)
+                let f_low = self._comp_rec(*lhs.low(), rhs);
+                let f_high = self._comp_rec(*lhs.high(), rhs);
+                self.make_node(*lhs.level(), f_low, f_high)
             }
             std::cmp::Ordering::Greater => {
-                let f_low = self._comp_rec(lhs, self.low(rhs));
-                let f_high = self._comp_rec(lhs, self.high(rhs));
-                self.make_node(self.level(rhs), f_low, f_high)
+                let f_low = self._comp_rec(lhs, *rhs.low());
+                let f_high = self._comp_rec(lhs, *rhs.high());
+                self.make_node(*rhs.level(), f_low, f_high)
             }
             std::cmp::Ordering::Equal => {
-                let f_low = self._comp_rec(self.low(lhs), self.low(rhs));
-                let f_high = self._comp_rec(self.high(lhs), self.high(rhs));
-                self.make_node(self.level(lhs), f_low, f_high)
+                let f_low = self._comp_rec(*lhs.low(), *rhs.low());
+                let f_high = self._comp_rec(*lhs.high(), *rhs.high());
+                self.make_node(*lhs.level(), f_low, f_high)
             }
         };
         self.comp_cache.insert(hash, (lhs, rhs), res);
         res
+    }
+
+    const MAX_LOAD_FACTOR: usize = 1usize;
+    const MIN_GC_RATIO: f64 = 0.25;
+
+    fn entor_op(&self) {
+        // if load factor is exceeded: we should do some clean up
+        // if gc can help reduce to threshold, do gc. otherwise resize
+        let entry_num = self.set.entry_num();
+        let bucket_size = self.set.bucket_size();
+        if entry_num >= bucket_size * Self::MAX_LOAD_FACTOR {
+            let marked = self.set.mark_nodes();
+            if entry_num - marked < (bucket_size as f64 * Self::MIN_GC_RATIO) as usize {
+                self.set.unmark_nodes();
+                // still exceed threshold after gc
+                self.set.grow();
+                self.and_cache.grow();
+                self.or_cache.grow();
+                self.comp_cache.grow();
+                self.not_cache.grow();
+                self.quant_exist_cache.grow();
+                self.quant_forall_cache.grow();
+            } else {
+                self.set.gc_unmarked();
+                self.set.unmark_nodes();
+                self.and_cache.invalidate_all();
+                self.or_cache.invalidate_all();
+                self.comp_cache.invalidate_all();
+                self.not_cache.invalidate_all();
+                self.quant_exist_cache.invalidate_all();
+                self.quant_forall_cache.invalidate_all();
+            }
+        }
     }
 }
 
@@ -467,10 +462,12 @@ mod tests {
 
     use flate2::Compression;
 
+    use crate::BddIO;
+
     use super::*;
     #[test]
     fn test_and() {
-        let manager: Manager<usize, ()> = Manager::init(1024, 1024, 3);
+        let manager: Manager = Manager::init(1024, 1024, 3);
         let a = manager.get_nvar(0);
         let b = manager.get_nvar(1);
         let c = manager.get_nvar(2);
@@ -491,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_comp() {
-        let manager: Manager<usize, ()> = Manager::init(1024, 1024, 3);
+        let manager: Manager = Manager::init(1024, 1024, 3);
         let a = manager.get_var(0);
         let nb = manager.get_nvar(1);
         let _c = manager.get_var(2);
@@ -511,8 +508,29 @@ mod tests {
     }
 
     #[test]
+    fn test_gc() {
+        let mut manager = Manager::init(8, 8, 3);
+        let a = manager.get_var(0);
+        let b = manager.get_var(1);
+        let c = manager.get_var(2);
+        // since ab or bc are not referenced, they will be freed after gc
+        manager.and(a, b);
+        manager.and(b, c);
+        manager.gc();
+
+        assert_eq!(manager.get_node_num(), 8);
+
+        let ab = manager.and(a, b);
+        manager.ref_bdd(ab);
+        let abc = manager.and(ab, c);
+        manager.ref_bdd(abc);
+        manager.gc();
+        assert_eq!(manager.get_node_num(), 10);
+    }
+
+    #[test]
     fn test_print_set() {
-        let manager: Manager<usize, ()> = Manager::init(1024, 1024, 3);
+        let manager: Manager = Manager::init(1024, 1024, 3);
         let a = manager.get_var(0);
         let b = manager.get_var(1);
         let c = manager.get_var(2);
@@ -542,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_ruddy_io() {
-        let manager: Manager<usize, ()> = Manager::init(1024, 1024, 3);
+        let manager: Manager = Manager::init(1024, 1024, 3);
         let a = manager.get_var(0);
         let b = manager.get_var(1);
         let c = manager.get_var(2);
@@ -555,12 +573,12 @@ mod tests {
         manager.ref_bdd(abc);
 
         let mut buffer = Vec::new();
-        BddIO::<usize, Vec<u8>, &[u8]>::serialize(&manager, abc, &mut buffer).unwrap();
+        BddIO::<Vec<u8>, &[u8]>::serialize(&manager, abc, &mut buffer).unwrap();
         manager.deref_bdd(ab);
         manager.deref_bdd(bc);
         manager.deref_bdd(abc);
 
-        let another_manager: Manager<usize, ()> = Manager::init(1024, 1024, 3);
+        let another_manager: Manager = Manager::init(1024, 1024, 3);
         let a = another_manager.get_var(0);
         let b = another_manager.get_var(1);
         let c = another_manager.get_var(2);
@@ -572,8 +590,7 @@ mod tests {
         let abc = another_manager.and(ab, bc);
         another_manager.ref_bdd(abc);
         let another_abc =
-            BddIO::<usize, Vec<u8>, &[u8]>::deserialize(&another_manager, &mut &buffer[..])
-                .unwrap();
+            BddIO::<Vec<u8>, &[u8]>::deserialize(&another_manager, &mut &buffer[..]).unwrap();
         another_manager.ref_bdd(another_abc);
 
         assert_eq!(abc, another_abc);
@@ -588,9 +605,9 @@ mod tests {
     fn test_ruddy_io_compressed() {
         const VAR_NUM: usize = 32;
 
-        let manager: Manager<usize, ()> = Manager::init(1024, 1024, VAR_NUM);
+        let manager: Manager = Manager::init(1024, 1024, VAR_NUM);
         let mut and_all = manager.get_true();
-        let mut tmp: usize;
+        let mut tmp: Bdd;
         for i in 0..VAR_NUM {
             let var = manager.get_var(i);
             tmp = manager.and(and_all, var);
@@ -600,11 +617,11 @@ mod tests {
         }
 
         let mut buffer_uncomp = Vec::new();
-        BddIO::<usize, Vec<u8>, &[u8]>::serialize(&manager, and_all, &mut buffer_uncomp).unwrap();
+        BddIO::<Vec<u8>, &[u8]>::serialize(&manager, and_all, &mut buffer_uncomp).unwrap();
         println!("Uncompressed size: {}", buffer_uncomp.len());
 
         let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), Compression::fast());
-        BddIO::<usize, flate2::write::DeflateEncoder<Vec<u8>>, flate2::read::DeflateDecoder<&[u8]>>::serialize(&manager, and_all, &mut encoder).unwrap();
+        BddIO::<flate2::write::DeflateEncoder<Vec<u8>>, flate2::read::DeflateDecoder<&[u8]>>::serialize(&manager, and_all, &mut encoder).unwrap();
         let buffer = encoder.finish().unwrap();
         manager.deref_bdd(and_all);
         println!("Compressed size: {}", buffer.len());
@@ -613,10 +630,9 @@ mod tests {
             1f64 - (buffer.len() as f64 / buffer_uncomp.len() as f64)
         );
 
-        let another_manager: Manager<usize, ()> = Manager::init(1024, 1024, VAR_NUM);
+        let another_manager: Manager = Manager::init(1024, 1024, VAR_NUM);
         let mut decoder = flate2::read::DeflateDecoder::new(&buffer[..]);
         let another_and_all = BddIO::<
-            usize,
             flate2::write::DeflateEncoder<Vec<u8>>,
             flate2::read::DeflateDecoder<&[u8]>,
         >::deserialize(&another_manager, &mut decoder)

@@ -2,7 +2,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use tobdd::{Bdd, BddManager, BddOp, Manager};
 
-type DefaultManager = Manager<usize, ()>;
+type DefaultManager = Manager;
 
 fn bench_n_queens(c: &mut Criterion) {
     let sizes = env_sizes("NQUEENS_SIZES", &[10]);

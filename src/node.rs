@@ -1,115 +1,97 @@
-use std::{
-    fmt::Debug,
-    hash::Hash,
-    sync::atomic::{AtomicPrimitive, AtomicPtr, AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicPtr, AtomicUsize};
 
-use funty::{AtLeast32, Unsigned};
+use crate::hash;
 
-use crate::alloc::Allocator;
-
-pub trait Idx: Unsigned + AtLeast32 + AtomicPrimitive {
-    const NULL: Self;
-}
-impl Idx for usize {
-    const NULL: Self = usize::MIN;
-}
-
-pub struct Node<I: Idx, A: Allocator<I>> {
+#[derive(Default)]
+pub struct Node {
     pub ref_cnt: AtomicUsize,
-    pub level: I,
-    pub low: I,
-    pub high: I,
-    pub next: NodePtr<I, A>,
+    pub level: usize,
+    pub low: *mut Node,
+    pub high: *mut Node,
+    pub next: AtomicPtr<Node>,
+    pub hash: u64,
 }
 
-impl<I: Idx, A: Allocator<I>> Node<I, A> {
+unsafe impl Send for Node {}
+unsafe impl Sync for Node {}
+
+impl Node {
     #[inline]
-    pub fn key(&self) -> (I, I, I) {
+    pub fn key(&self) -> (usize, *mut Node, *mut Node) {
         (self.level, self.low, self.high)
     }
-}
 
-impl<A: Allocator<usize>> Default for Node<usize, A> {
-    fn default() -> Self {
-        Self {
-            ref_cnt: Default::default(),
-            level: Default::default(),
-            low: Default::default(),
-            high: Default::default(),
+    #[inline]
+    pub fn new(level: usize) -> Self {
+        Node {
+            ref_cnt: AtomicUsize::new(0),
+            level,
+            low: std::ptr::null_mut(),
+            high: std::ptr::null_mut(),
             next: Default::default(),
+            hash: hash::splitmix64_3(level as u64, 0, 0),
         }
     }
-}
 
-impl<A: Allocator<usize>> Node<usize, A> {
-    pub fn from(level: usize, low: usize, high: usize) -> Self {
+    #[inline]
+    pub fn from(level: usize, low: *mut Node, high: *mut Node) -> Self {
         Node {
             ref_cnt: AtomicUsize::new(0),
             level,
             low,
             high,
-            next: NodePtr::default(),
+            next: Default::default(),
+            hash: hash::splitmix64_3(level as u64, low as u64, high as u64),
         }
     }
 }
 
-pub(crate) struct NodePtr<I: Idx, A: Allocator<I>> {
-    pub ptr: I::AtomicInner,
-    pub alloc: A,
+#[allow(clippy::mut_from_ref)]
+pub trait NodePtr {
+    fn node_hash(&self) -> u64;
+    fn rehash(&mut self);
+    fn level(&mut self) -> &mut usize;
+    fn low(&mut self) -> &mut *mut Node;
+    fn high(&mut self) -> &mut *mut Node;
+    fn ref_cnt(&self) -> &AtomicUsize;
+    fn next(&self) -> &AtomicPtr<Node>;
 }
 
-impl<A: Allocator<usize>> Default for NodePtr<usize, A> {
-    fn default() -> Self {
-        Self {
-            ptr: Default::default(),
-            alloc: Default::default(),
-        }
-    }
-}
-
-// Safety: NodeRef only holds a pointer to the allocator. The allocator is Send + Sync,
-// nodes are immutable after insertion, and ref_cnt updates are atomic.
-unsafe impl<I: Idx, A: Allocator<I>> Send for NodePtr<I, A> {}
-unsafe impl<I: Idx, A: Allocator<I>> Sync for NodePtr<I, A> {}
-
-impl<A: Allocator<usize>> NodePtr<usize, A> {
+impl NodePtr for *mut Node {
     #[inline]
-    pub fn from(idx: usize, alloc: A) -> Self {
-        NodePtr {
-            ptr: AtomicUsize::new(idx),
-            alloc,
-        }
+    fn node_hash(&self) -> u64 {
+        let node = unsafe { &**self };
+        node.hash
+    }
+
+    #[inline]
+    fn rehash(&mut self) {
+        let node = unsafe { &mut **self };
+        node.hash = hash::splitmix64_3(node.level as u64, node.low as u64, node.high as u64);
+    }
+
+    #[inline]
+    fn level(&mut self) -> &mut usize {
+        unsafe { &mut (**self).level }
+    }
+
+    #[inline]
+    fn low(&mut self) -> &mut *mut Node {
+        unsafe { &mut (**self).low }
+    }
+
+    #[inline]
+    fn high(&mut self) -> &mut *mut Node {
+        unsafe { &mut (**self).high }
+    }
+
+    #[inline]
+    fn ref_cnt(&self) -> &AtomicUsize {
+        unsafe { &(**self).ref_cnt }
+    }
+
+    #[inline]
+    fn next(&self) -> &AtomicPtr<Node> {
+        unsafe { &(**self).next }
     }
 }
-
-impl<A: Allocator<usize>> Debug for NodePtr<usize, A> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let node = self.alloc.index(self.ptr.load(Ordering::Relaxed));
-        f.debug_struct("NodeRef")
-            .field("idx", &self.ptr)
-            .field("level", &node.level)
-            .field("low", &node.low)
-            .field("high", &node.high)
-            .finish()
-    }
-}
-
-impl<A: Allocator<usize>> Hash for NodePtr<usize, A> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let node = self.alloc.index(self.ptr.load(Ordering::Relaxed));
-        node.level.hash(state);
-        node.low.hash(state);
-        node.high.hash(state);
-    }
-}
-
-impl<A: Allocator<usize>> PartialEq for NodePtr<usize, A> {
-    fn eq(&self, other: &Self) -> bool {
-        let node1 = self.alloc.index(self.ptr.load(Ordering::Relaxed));
-        let node2 = other.alloc.index(other.ptr.load(Ordering::Relaxed));
-        node1.level == node2.level && node1.low == node2.low && node1.high == node2.high
-    }
-}
-
-impl<A: Allocator<usize>> Eq for NodePtr<usize, A> {}
