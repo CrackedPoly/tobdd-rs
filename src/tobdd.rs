@@ -215,7 +215,7 @@ impl BddManager for Manager {
 #[allow(unused)]
 impl BddOp for Manager {
     fn not(&self, bdd: Bdd) -> Bdd {
-        self.entor_op();
+        self.enter_op();
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.not_cnt.fetch_add(1, Ordering::Relaxed);
@@ -234,7 +234,7 @@ impl BddOp for Manager {
     }
 
     fn and(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
-        self.entor_op();
+        self.enter_op();
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.and_cnt.fetch_add(1, Ordering::Relaxed);
@@ -253,7 +253,7 @@ impl BddOp for Manager {
     }
 
     fn or(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
-        self.entor_op();
+        self.enter_op();
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.or_cnt.fetch_add(1, Ordering::Relaxed);
@@ -272,7 +272,7 @@ impl BddOp for Manager {
     }
 
     fn comp(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
-        self.entor_op();
+        self.enter_op();
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.comp_cnt.fetch_add(1, Ordering::Relaxed);
@@ -291,12 +291,12 @@ impl BddOp for Manager {
     }
 
     fn exist(&self, bdd: Bdd, cube: Bdd) -> Bdd {
-        self.entor_op();
+        self.enter_op();
         todo!()
     }
 
     fn forall(&self, bdd: Bdd, cube: Bdd) -> Bdd {
-        self.entor_op();
+        self.enter_op();
         todo!()
     }
 }
@@ -615,7 +615,7 @@ impl Manager {
     const MAX_LOAD_FACTOR: usize = 1usize;
     const MIN_GC_RATIO: f64 = 0.25;
 
-    fn entor_op(&self) {
+    fn enter_op(&self) {
         // if load factor is exceeded: we should do some clean up
         // if gc can help reduce to threshold, do gc. otherwise resize
         let entry_num = self.set.entry_num();
