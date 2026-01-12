@@ -85,7 +85,6 @@ fn exactly_one(manager: &DefaultManager, vars: &[usize]) -> BddRef {
     let at_least = or_vars(manager, vars);
     let at_most = at_most_one(manager, vars);
     let both = manager.and(at_least.id, at_most.id);
-    manager.ref_bdd(both);
     if at_least.refed {
         manager.deref_bdd(at_least.id);
     }
@@ -106,7 +105,6 @@ fn at_most_one(manager: &DefaultManager, vars: &[usize]) -> BddRef {
         for j in (i + 1)..vars.len() {
             let nj = manager.get_nvar(vars[j]);
             let clause = manager.or(ni, nj);
-            manager.ref_bdd(clause);
             acc = and_inplace(manager, acc, BddRef::new(clause, true));
         }
     }
@@ -117,7 +115,6 @@ fn or_vars(manager: &DefaultManager, vars: &[usize]) -> BddRef {
     let mut acc = BddRef::new(manager.get_var(vars[0]), false);
     for &var in vars.iter().skip(1) {
         let tmp = manager.or(acc.id, manager.get_var(var));
-        manager.ref_bdd(tmp);
         if acc.refed {
             manager.deref_bdd(acc.id);
         }
@@ -128,7 +125,6 @@ fn or_vars(manager: &DefaultManager, vars: &[usize]) -> BddRef {
 
 fn and_inplace(manager: &DefaultManager, lhs: BddRef, rhs: BddRef) -> BddRef {
     let tmp = manager.and(lhs.id, rhs.id);
-    manager.ref_bdd(tmp);
     if lhs.refed {
         manager.deref_bdd(lhs.id);
     }

@@ -10,6 +10,7 @@ use ahash::AHashMap;
 use cpu_time::ThreadTime;
 
 use crate::BddIO;
+use crate::spin::rw_w_pre::{ReadGuard, SpinRwLock};
 use crate::{
     Bdd, BddManager, BddOp, IoRead, IoWrite, PrintSet,
     cache::{Cache, LockFreeCache},
@@ -90,6 +91,7 @@ impl std::fmt::Display for OpStat {
 #[allow(unused)]
 pub struct Manager {
     set: LockFreeSet,
+    rw_lock: SpinRwLock<()>,
 
     num_vars: usize,
 
@@ -135,6 +137,7 @@ impl BddManager for Manager {
         }
         Manager {
             set,
+            rw_lock: SpinRwLock::default(),
             true_id,
             false_id,
             num_vars: var_num,
@@ -173,49 +176,49 @@ impl BddManager for Manager {
         self.set.entry_num()
     }
 
-    fn ref_bdd(&self, bdd: Bdd) {
-        bdd.ref_cnt().fetch_add(1, Ordering::Relaxed);
-    }
-
     fn deref_bdd(&self, bdd: Bdd) {
         bdd.ref_cnt().fetch_sub(1, Ordering::Relaxed);
     }
 
     fn gc(&self) -> usize {
-        #[cfg(feature = "op_stat")]
-        {
-            self.op_stat.gc_cnt.fetch_add(1, Ordering::Relaxed);
-            self.op_stat
-                .gc_time
-                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(_w_guard) = self.rw_lock.try_write() {
+            #[cfg(feature = "op_stat")]
+            {
+                self.op_stat.gc_cnt.fetch_add(1, Ordering::Relaxed);
+                self.op_stat
+                    .gc_time
+                    .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            #[cfg(feature = "op_stat")]
+            let before = self.set.entry_num();
+            let marked = self.set.mark_nodes();
+            self.set.gc_unmarked();
+            self.set.unmark_nodes();
+            self.and_cache.invalidate_all();
+            self.or_cache.invalidate_all();
+            self.comp_cache.invalidate_all();
+            self.not_cache.invalidate_all();
+            self.quant_exist_cache.invalidate_all();
+            self.quant_forall_cache.invalidate_all();
+            #[cfg(feature = "op_stat")]
+            {
+                let freed = before.saturating_sub(marked);
+                self.op_stat.gc_freed.fetch_add(freed, Ordering::Relaxed);
+                self.op_stat
+                    .gc_time
+                    .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            marked
+        } else {
+            0
         }
-        #[cfg(feature = "op_stat")]
-        let before = self.set.entry_num();
-        let marked = self.set.mark_nodes();
-        self.set.gc_unmarked();
-        self.set.unmark_nodes();
-        self.and_cache.invalidate_all();
-        self.or_cache.invalidate_all();
-        self.comp_cache.invalidate_all();
-        self.not_cache.invalidate_all();
-        self.quant_exist_cache.invalidate_all();
-        self.quant_forall_cache.invalidate_all();
-        #[cfg(feature = "op_stat")]
-        {
-            let freed = before.saturating_sub(marked);
-            self.op_stat.gc_freed.fetch_add(freed, Ordering::Relaxed);
-            self.op_stat
-                .gc_time
-                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
-        marked
     }
 }
 
 #[allow(unused)]
 impl BddOp for Manager {
     fn not(&self, bdd: Bdd) -> Bdd {
-        self.enter_op();
+        let _g = self.enter_op();
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.not_cnt.fetch_add(1, Ordering::Relaxed);
@@ -230,11 +233,12 @@ impl BddOp for Manager {
                 .not_time
                 .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        self.exit_op();
         ret
     }
 
     fn and(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
-        self.enter_op();
+        let _g = self.enter_op();
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.and_cnt.fetch_add(1, Ordering::Relaxed);
@@ -249,11 +253,12 @@ impl BddOp for Manager {
                 .and_time
                 .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        self.exit_op();
         ret
     }
 
     fn or(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
-        self.enter_op();
+        let _g = self.enter_op();
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.or_cnt.fetch_add(1, Ordering::Relaxed);
@@ -268,11 +273,12 @@ impl BddOp for Manager {
                 .or_time
                 .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        self.exit_op();
         ret
     }
 
     fn comp(&self, lhs: Bdd, rhs: Bdd) -> Bdd {
-        self.enter_op();
+        let _g = self.enter_op();
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.comp_cnt.fetch_add(1, Ordering::Relaxed);
@@ -287,16 +293,19 @@ impl BddOp for Manager {
                 .comp_time
                 .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        self.exit_op();
         ret
     }
 
     fn exist(&self, bdd: Bdd, cube: Bdd) -> Bdd {
-        self.enter_op();
+        let _g = self.enter_op();
+        self.exit_op();
         todo!()
     }
 
     fn forall(&self, bdd: Bdd, cube: Bdd) -> Bdd {
-        self.enter_op();
+        let _g = self.enter_op();
+        self.exit_op();
         todo!()
     }
 }
@@ -444,6 +453,10 @@ thread_local! {
 }
 
 impl Manager {
+    pub fn ref_bdd(&self, bdd: Bdd) {
+        bdd.ref_cnt().fetch_add(1, Ordering::Relaxed);
+    }
+
     fn make_node(&self, level: usize, low: Bdd, high: Bdd) -> Bdd {
         if low == high {
             return low;
@@ -615,12 +628,15 @@ impl Manager {
     const MAX_LOAD_FACTOR: usize = 1usize;
     const MIN_GC_RATIO: f64 = 0.25;
 
-    fn enter_op(&self) {
-        // if load factor is exceeded: we should do some clean up
-        // if gc can help reduce to threshold, do gc. otherwise resize
+    fn enter_op(&self) -> ReadGuard<'_, ()> {
+        // if load factor exceeds the threadhold, we should do some clean up:
+        // 1. if gc can help reduce at least some nodes, gc will do
+        // 2. if gc only clean a small amout of nodes, we need a resize
         let entry_num = self.set.entry_num();
         let bucket_size = self.set.bucket_size();
-        if entry_num >= bucket_size * Self::MAX_LOAD_FACTOR {
+        if entry_num >= bucket_size * Self::MAX_LOAD_FACTOR
+            && let Some(_w_guard) = self.rw_lock.try_write()
+        {
             let marked = self.set.mark_nodes();
             if entry_num - marked < (bucket_size as f64 * Self::MIN_GC_RATIO) as usize {
                 #[cfg(feature = "op_stat")]
@@ -674,7 +690,11 @@ impl Manager {
                 }
             }
         }
+
+        self.rw_lock.read()
     }
+
+    fn exit_op(&self) {}
 }
 
 #[cfg(test)]

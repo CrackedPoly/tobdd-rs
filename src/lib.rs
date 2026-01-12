@@ -1,6 +1,6 @@
 #![feature(isolate_most_least_significant_one)]
-mod alloc;
 mod cache;
+mod spin;
 mod hash;
 mod node;
 mod set;
@@ -38,12 +38,13 @@ pub trait BddManager: BddOp {
         bdd == self.get_false()
     }
     fn get_node_num(&self) -> usize;
-    fn ref_bdd(&self, bdd: Bdd);
     fn deref_bdd(&self, bdd: Bdd);
     fn gc(&self) -> usize;
 }
 
 /// Apply BDD operations.
+/// BDD returned by methods of this trait is automatically referenced, manually dereference it if
+/// not used anymore.
 pub trait BddOp {
     // propositional logic operations
     fn not(&self, bdd: Bdd) -> Bdd;
