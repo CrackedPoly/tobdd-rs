@@ -23,22 +23,16 @@ use crate::{
 #[derive(Default)]
 pub struct OpStat {
     pub not_cnt: AtomicUsize,
-    pub not_time: AtomicU64,
 
     pub and_cnt: AtomicUsize,
-    pub and_time: AtomicU64,
 
     pub or_cnt: AtomicUsize,
-    pub or_time: AtomicU64,
 
     pub comp_cnt: AtomicUsize,
-    pub comp_time: AtomicU64,
 
     pub quant_exist_cnt: AtomicUsize,
-    pub quant_exist_time: AtomicU64,
 
     pub quant_forall_cnt: AtomicUsize,
-    pub quant_forall_time: AtomicU64,
 
     pub gc_cnt: AtomicUsize,
     pub gc_time: AtomicU64,
@@ -53,24 +47,20 @@ pub struct OpStat {
 impl std::fmt::Display for OpStat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "NOT: (cnt: {}, time: {} us)\n",
+            "NOT: (cnt: {})\n",
             self.not_cnt.load(Ordering::Relaxed),
-            self.not_time.load(Ordering::Relaxed)
         ))?;
         f.write_fmt(format_args!(
-            "AND: (cnt: {}, time: {} us)\n",
+            "AND: (cnt: {})\n",
             self.and_cnt.load(Ordering::Relaxed),
-            self.and_time.load(Ordering::Relaxed)
         ))?;
         f.write_fmt(format_args!(
-            "OR: (cnt: {}, time: {} us)\n",
+            "OR: (cnt: {})\n",
             self.or_cnt.load(Ordering::Relaxed),
-            self.or_time.load(Ordering::Relaxed)
         ))?;
         f.write_fmt(format_args!(
-            "COMP: (cnt: {}, time: {} us)\n",
+            "COMP: (cnt: {})\n",
             self.comp_cnt.load(Ordering::Relaxed),
-            self.comp_time.load(Ordering::Relaxed)
         ))?;
         f.write_fmt(format_args!(
             "GC: (cnt: {}, time: {} us, freed: {})\n",
@@ -222,17 +212,9 @@ impl BddOp for Manager {
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.not_cnt.fetch_add(1, Ordering::Relaxed);
-            self.op_stat
-                .not_time
-                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let ret = self._not_rec(bdd);
-        #[cfg(feature = "op_stat")]
-        {
-            self.op_stat
-                .not_time
-                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
+        self.ref_bdd(ret);
         self.exit_op();
         ret
     }
@@ -242,17 +224,9 @@ impl BddOp for Manager {
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.and_cnt.fetch_add(1, Ordering::Relaxed);
-            self.op_stat
-                .and_time
-                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let ret = self._and_rec(lhs, rhs);
-        #[cfg(feature = "op_stat")]
-        {
-            self.op_stat
-                .and_time
-                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
+        self.ref_bdd(ret);
         self.exit_op();
         ret
     }
@@ -262,17 +236,9 @@ impl BddOp for Manager {
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.or_cnt.fetch_add(1, Ordering::Relaxed);
-            self.op_stat
-                .or_time
-                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let ret = self._or_rec(lhs, rhs);
-        #[cfg(feature = "op_stat")]
-        {
-            self.op_stat
-                .or_time
-                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
+        self.ref_bdd(ret);
         self.exit_op();
         ret
     }
@@ -282,17 +248,9 @@ impl BddOp for Manager {
         #[cfg(feature = "op_stat")]
         {
             self.op_stat.comp_cnt.fetch_add(1, Ordering::Relaxed);
-            self.op_stat
-                .comp_time
-                .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let ret = self._comp_rec(lhs, rhs);
-        #[cfg(feature = "op_stat")]
-        {
-            self.op_stat
-                .comp_time
-                .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
+        self.ref_bdd(ret);
         self.exit_op();
         ret
     }
@@ -372,6 +330,7 @@ impl<W: IoWrite, R: IoRead> BddIO<W, R> for Manager {
     }
 
     fn deserialize(&self, reader: &mut R) -> std::io::Result<Bdd> {
+        let _r_guard = self.rw_lock.read();
         let mut map: AHashMap<usize, Bdd> = AHashMap::default();
         #[allow(unused_assignments)]
         let (mut bdd, mut level, mut low, mut high, mut ret) =
@@ -397,6 +356,7 @@ impl<W: IoWrite, R: IoRead> BddIO<W, R> for Manager {
         for b in map.values() {
             self.deref_bdd(*b);
         }
+        self.ref_bdd(ret);
         Ok(ret)
     }
 }
@@ -716,9 +676,7 @@ mod tests {
         let mut buf = Vec::new();
 
         let and_ab = manager.and(a, b);
-        manager.ref_bdd(and_ab);
         let and_abc = manager.and(and_ab, c);
-        manager.ref_bdd(and_abc);
 
         manager.print(and_abc, &mut buf).unwrap();
         debug_assert_eq!(from_utf8(&buf).unwrap(), "000\n");
@@ -737,9 +695,7 @@ mod tests {
         let mut buf = Vec::new();
 
         let a_and_nb = manager.and(a, nb);
-        manager.ref_bdd(a_and_nb);
         let comp = manager.comp(a, a_and_nb);
-        manager.ref_bdd(comp);
 
         manager.print(comp, &mut buf).unwrap();
         debug_assert_eq!(from_utf8(&buf).unwrap(), "11*\n");
@@ -750,23 +706,21 @@ mod tests {
 
     #[test]
     fn test_gc() {
-        let mut manager = Manager::init(8, 8, 3);
+        let manager = Manager::init(8, 8, 3);
         let a = manager.get_var(0);
         let b = manager.get_var(1);
         let c = manager.get_var(2);
-        // since ab or bc are not referenced, they will be freed after gc
-        manager.and(a, b);
-        manager.and(b, c);
-        manager.gc();
-
-        assert_eq!(manager.get_node_num(), 8);
 
         let ab = manager.and(a, b);
-        manager.ref_bdd(ab);
-        let abc = manager.and(ab, c);
-        manager.ref_bdd(abc);
+        let bc = manager.and(b, c);
         manager.gc();
+
         assert_eq!(manager.get_node_num(), 10);
+
+        manager.deref_bdd(ab);
+        manager.deref_bdd(bc);
+        manager.gc();
+        assert_eq!(manager.get_node_num(), 8);
     }
 
     #[test]
@@ -777,11 +731,8 @@ mod tests {
         let c = manager.get_var(2);
 
         let ab = manager.and(a, b);
-        manager.ref_bdd(ab);
         let bc = manager.and(b, c);
-        manager.ref_bdd(bc);
         let abc = manager.or(ab, bc);
-        manager.ref_bdd(abc);
 
         let mut buf = Vec::new();
 
@@ -793,6 +744,10 @@ mod tests {
         buf.clear();
         PrintSet::print(&manager, abc, &mut buf).unwrap();
         debug_assert_eq!(from_utf8(&buf).unwrap(), "011\n11*\n");
+
+        buf.clear();
+        PrintSet::print(&manager, ab, &mut buf).unwrap();
+        dbg!(from_utf8(&buf).unwrap());
 
         manager.deref_bdd(ab);
         manager.deref_bdd(bc);
@@ -807,11 +762,8 @@ mod tests {
         let c = manager.get_var(2);
 
         let ab = manager.and(a, b);
-        manager.ref_bdd(ab);
         let bc = manager.and(b, c);
-        manager.ref_bdd(bc);
         let abc = manager.and(ab, bc);
-        manager.ref_bdd(abc);
 
         let mut buffer = Vec::new();
         BddIO::<Vec<u8>, &[u8]>::serialize(&manager, abc, &mut buffer).unwrap();
@@ -825,14 +777,10 @@ mod tests {
         let c = another_manager.get_var(2);
 
         let ab = another_manager.and(a, b);
-        another_manager.ref_bdd(ab);
         let bc = another_manager.and(b, c);
-        another_manager.ref_bdd(bc);
         let abc = another_manager.and(ab, bc);
-        another_manager.ref_bdd(abc);
         let another_abc =
             BddIO::<Vec<u8>, &[u8]>::deserialize(&another_manager, &mut &buffer[..]).unwrap();
-        another_manager.ref_bdd(another_abc);
 
         assert_eq!(abc, another_abc);
 
@@ -852,7 +800,6 @@ mod tests {
         for i in 0..VAR_NUM {
             let var = manager.get_var(i);
             tmp = manager.and(and_all, var);
-            manager.ref_bdd(tmp);
             manager.deref_bdd(and_all);
             and_all = tmp;
         }

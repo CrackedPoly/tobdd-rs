@@ -1,9 +1,9 @@
 #![feature(isolate_most_least_significant_one)]
 mod cache;
-mod spin;
 mod hash;
 mod node;
 mod set;
+mod spin;
 mod tobdd;
 
 use std::io::{Read as IoRead, Result as IoResult, Write as IoWrite};
@@ -43,8 +43,8 @@ pub trait BddManager: BddOp {
 }
 
 /// Apply BDD operations.
-/// BDD returned by methods of this trait is automatically referenced, manually dereference it if
-/// not used anymore.
+/// BDD returned by operation methods of this trait is automatically referenced to avoid being
+/// concurrently garbage collected, manually dereference it if not used anymore.
 pub trait BddOp {
     // propositional logic operations
     fn not(&self, bdd: Bdd) -> Bdd;
