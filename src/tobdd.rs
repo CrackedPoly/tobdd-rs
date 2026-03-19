@@ -10,7 +10,7 @@ use ahash::AHashMap;
 use cpu_time::ThreadTime;
 
 use crate::BddIO;
-use crate::spin::rw_w_pre::{ReadGuard, SpinRwLock};
+use crate::spin::distributed_rw::{DistributedRwLock, ReadGuard};
 use crate::{
     Bdd, BddManager, BddOp, IoRead, IoWrite, PrintSet,
     cache::{Cache, LockFreeCache},
@@ -81,7 +81,7 @@ impl std::fmt::Display for OpStat {
 #[allow(unused)]
 pub struct Manager {
     set: LockFreeSet,
-    rw_lock: SpinRwLock<()>,
+    rw_lock: DistributedRwLock,
 
     num_vars: usize,
 
@@ -127,7 +127,7 @@ impl BddManager for Manager {
         }
         Manager {
             set,
-            rw_lock: SpinRwLock::default(),
+            rw_lock: DistributedRwLock::default(),
             true_id,
             false_id,
             num_vars: var_num,
@@ -198,6 +198,7 @@ impl BddManager for Manager {
                     .gc_time
                     .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+            self.set.clear_needs_gc();
             marked
         } else {
             0
@@ -297,6 +298,7 @@ impl std::fmt::Debug for Manager {
         #[cfg(feature = "op_stat")]
         {
             f.write_fmt(format_args!("Op stat: {}\n", self.op_stat))?;
+            f.write_fmt(format_args!("RwLock stat: {}\n", self.rw_lock.stat))?;
         }
         self.set.sanity_check();
         Ok(())
@@ -588,67 +590,63 @@ impl Manager {
     const MAX_LOAD_FACTOR: usize = 1usize;
     const MIN_GC_RATIO: f64 = 0.25;
 
-    fn enter_op(&self) -> ReadGuard<'_, ()> {
-        // if load factor exceeds the threadhold, we should do some clean up:
-        // 1. if gc can help reduce at least some nodes, gc will do
-        // 2. if gc only clean a small amout of nodes, we need a resize
+    fn enter_op(&self) -> ReadGuard<'_> {
         let entry_num = self.set.entry_num();
         let bucket_size = self.set.bucket_size();
         if entry_num >= bucket_size * Self::MAX_LOAD_FACTOR
             && let Some(_w_guard) = self.rw_lock.try_write()
         {
-            let marked = self.set.mark_nodes();
-            if entry_num - marked < (bucket_size as f64 * Self::MIN_GC_RATIO) as usize {
-                #[cfg(feature = "op_stat")]
-                {
-                    self.op_stat.grow_cnt.fetch_add(1, Ordering::Relaxed);
-                    self.op_stat
-                        .grow_time
-                        .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let marked = self.set.mark_nodes();
+                if entry_num - marked < (bucket_size as f64 * Self::MIN_GC_RATIO) as usize {
+                    #[cfg(feature = "op_stat")]
+                    {
+                        self.op_stat.grow_cnt.fetch_add(1, Ordering::Relaxed);
+                        self.op_stat
+                            .grow_time
+                            .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    self.set.unmark_nodes();
+                    self.set.grow();
+                    self.and_cache.grow();
+                    self.or_cache.grow();
+                    self.comp_cache.grow();
+                    self.not_cache.grow();
+                    self.quant_exist_cache.grow();
+                    self.quant_forall_cache.grow();
+                    #[cfg(feature = "op_stat")]
+                    {
+                        let new_bucket_size = self.set.bucket_size();
+                        let newed = new_bucket_size.saturating_sub(bucket_size);
+                        self.op_stat.grow_newed.fetch_add(newed, Ordering::Relaxed);
+                        self.op_stat
+                            .grow_time
+                            .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                } else {
+                    #[cfg(feature = "op_stat")]
+                    {
+                        self.op_stat.gc_cnt.fetch_add(1, Ordering::Relaxed);
+                        self.op_stat
+                            .gc_time
+                            .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    self.set.gc_unmarked();
+                    self.set.unmark_nodes();
+                    self.and_cache.invalidate_all();
+                    self.or_cache.invalidate_all();
+                    self.comp_cache.invalidate_all();
+                    self.not_cache.invalidate_all();
+                    self.quant_exist_cache.invalidate_all();
+                    self.quant_forall_cache.invalidate_all();
+                    #[cfg(feature = "op_stat")]
+                    {
+                        let freed = entry_num.saturating_sub(marked);
+                        self.op_stat.gc_freed.fetch_add(freed, Ordering::Relaxed);
+                        self.op_stat
+                            .gc_time
+                            .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                 }
-                self.set.unmark_nodes();
-                // still exceed threshold after gc
-                self.set.grow();
-                self.and_cache.grow();
-                self.or_cache.grow();
-                self.comp_cache.grow();
-                self.not_cache.grow();
-                self.quant_exist_cache.grow();
-                self.quant_forall_cache.grow();
-                #[cfg(feature = "op_stat")]
-                {
-                    let new_bucket_size = self.set.bucket_size();
-                    let newed = new_bucket_size.saturating_sub(bucket_size);
-                    self.op_stat.grow_newed.fetch_add(newed, Ordering::Relaxed);
-                    self.op_stat
-                        .grow_time
-                        .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
-                }
-            } else {
-                #[cfg(feature = "op_stat")]
-                {
-                    self.op_stat.gc_cnt.fetch_add(1, Ordering::Relaxed);
-                    self.op_stat
-                        .gc_time
-                        .fetch_sub(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
-                }
-                self.set.gc_unmarked();
-                self.set.unmark_nodes();
-                self.and_cache.invalidate_all();
-                self.or_cache.invalidate_all();
-                self.comp_cache.invalidate_all();
-                self.not_cache.invalidate_all();
-                self.quant_exist_cache.invalidate_all();
-                self.quant_forall_cache.invalidate_all();
-                #[cfg(feature = "op_stat")]
-                {
-                    let freed = entry_num.saturating_sub(marked);
-                    self.op_stat.gc_freed.fetch_add(freed, Ordering::Relaxed);
-                    self.op_stat
-                        .gc_time
-                        .fetch_add(self.timer.elapsed().as_micros() as u64, Ordering::Relaxed);
-                }
-            }
         }
 
         self.rw_lock.read()

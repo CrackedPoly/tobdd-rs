@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::cmp::Ordering as CmpOrd;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 #[cfg(feature = "table_stat")]
 use std::fmt::Display;
@@ -115,6 +115,7 @@ pub struct LockFreeSet {
     size_exp: Cell<usize>,
     num_marks: Cell<usize>,
     num_entry: AtomicUsize,
+    needs_gc: AtomicBool,
     #[cfg(feature = "table_stat")]
     pub stat: TableStat,
 }
@@ -131,6 +132,7 @@ impl LockFreeSet {
             size_exp: Cell::new(size_exp as usize),
             num_marks: Cell::new(0),
             num_entry: AtomicUsize::new(0),
+            needs_gc: AtomicBool::new(false),
             #[cfg(feature = "table_stat")]
             stat: TableStat::default(),
         }
@@ -138,6 +140,14 @@ impl LockFreeSet {
 
     pub fn bucket_size(&self) -> usize {
         1 << self.size_exp.get()
+    }
+
+    pub fn needs_gc(&self) -> bool {
+        self.needs_gc.load(Ordering::Relaxed)
+    }
+
+    pub fn clear_needs_gc(&self) {
+        self.needs_gc.store(false, Ordering::Relaxed);
     }
 
     pub fn entry_num(&self) -> usize {
@@ -309,7 +319,10 @@ impl Set for LockFreeSet {
             ) {
                 Ok(_) => {
                     // 插入成功
-                    self.num_entry.fetch_add(1, Ordering::Relaxed);
+                    let prev = self.num_entry.fetch_add(1, Ordering::Relaxed);
+                    if prev + 1 >= 1 << self.size_exp.get() {
+                        self.needs_gc.store(true, Ordering::Relaxed);
+                    }
                     #[cfg(feature = "table_stat")]
                     self.stat.unique_miss.fetch_add(1, Ordering::Relaxed);
                     return (new_ptr, true);
@@ -363,6 +376,7 @@ impl Set for LockFreeSet {
         // 切换到新桶数组
         self.buckets.set(Box::into_raw(new_buckets));
         self.size_exp.set(new_size_exp);
+        self.needs_gc.store(false, Ordering::Relaxed);
     }
 
     // Starting from nodes that its rec_cnt != 0, mark recursively by setting the highest of
@@ -413,6 +427,7 @@ impl Set for LockFreeSet {
         }
         self.num_entry
             .store(self.num_marks.get(), Ordering::Relaxed);
+        self.needs_gc.store(false, Ordering::Relaxed);
     }
 
     fn unmark_nodes(&self) {

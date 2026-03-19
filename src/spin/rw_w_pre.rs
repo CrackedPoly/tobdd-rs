@@ -6,6 +6,45 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "op_stat")]
+pub struct RwLockStat {
+    pub read_acquires: AtomicUsize,
+    pub read_cas_retries: AtomicUsize,
+    pub read_writer_spins: AtomicUsize,
+}
+
+#[cfg(feature = "op_stat")]
+impl Default for RwLockStat {
+    fn default() -> Self {
+        Self {
+            read_acquires: AtomicUsize::new(0),
+            read_cas_retries: AtomicUsize::new(0),
+            read_writer_spins: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "op_stat")]
+impl std::fmt::Display for RwLockStat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let acquires = self.read_acquires.load(Ordering::Relaxed);
+        let cas_retries = self.read_cas_retries.load(Ordering::Relaxed);
+        let writer_spins = self.read_writer_spins.load(Ordering::Relaxed);
+        write!(
+            f,
+            "read_acquires: {}, read_cas_retries: {}, read_writer_spins: {} (retry_rate: {:.4}%)",
+            acquires,
+            cas_retries,
+            writer_spins,
+            if acquires > 0 {
+                (cas_retries as f64 / acquires as f64) * 100.0
+            } else {
+                0.0
+            }
+        )
+    }
+}
+
 const WRITE_LOCKED: usize = 1 << 0;
 const WRITE_PENDING: usize = 1 << 1;
 
@@ -15,6 +54,8 @@ const READER_ONE: usize = 1 << READER_SHIFT;
 pub struct SpinRwLock<T> {
     state: AtomicUsize,
     value: UnsafeCell<T>,
+    #[cfg(feature = "op_stat")]
+    pub stat: RwLockStat,
 }
 
 pub struct ReadGuard<'a, T> {
@@ -33,15 +74,19 @@ impl<T: Default> Default for SpinRwLock<T> {
         Self {
             state: Default::default(),
             value: Default::default(),
+            #[cfg(feature = "op_stat")]
+            stat: RwLockStat::default(),
         }
     }
 }
 
 impl<T> SpinRwLock<T> {
-    pub const fn new(value: T) -> Self {
+    pub fn new(value: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
             value: UnsafeCell::new(value),
+            #[cfg(feature = "op_stat")]
+            stat: RwLockStat::default(),
         }
     }
 
@@ -52,6 +97,8 @@ impl<T> SpinRwLock<T> {
 
             // 有写者（正在写 or 已占坑准备写） => 等待
             if (s & (WRITE_LOCKED | WRITE_PENDING)) != 0 {
+                #[cfg(feature = "op_stat")]
+                self.stat.read_writer_spins.fetch_add(1, Ordering::Relaxed);
                 spin_loop();
                 continue;
             }
@@ -63,12 +110,16 @@ impl<T> SpinRwLock<T> {
                 .compare_exchange_weak(s, new, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                #[cfg(feature = "op_stat")]
+                self.stat.read_acquires.fetch_add(1, Ordering::Relaxed);
                 return ReadGuard {
                     lock: self,
                     _marker: PhantomData,
                 };
             }
 
+            #[cfg(feature = "op_stat")]
+            self.stat.read_cas_retries.fetch_add(1, Ordering::Relaxed);
             spin_loop();
         }
     }
