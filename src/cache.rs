@@ -63,11 +63,12 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
     fn insert(&self, hash: u64, key: K, value: V) -> bool {
         let idx = hash & ((1 << self.size_exp.get()) - 1);
         let lock = &(unsafe { &*self.entries.get() }[idx as usize]);
-        // no thread is reading, it write
-        lock.try_write_once(|pair| {
+        // blocking write - waits for readers to finish
+        lock.write(|pair| {
             pair.0 = key;
             pair.1 = value;
-        })
+        });
+        true
     }
 
     fn invalidate_all(&self) {

@@ -76,6 +76,33 @@ impl<T> SpinRwLock<T> {
         self.state.store(0, Ordering::Release);
         true
     }
+
+    /// Blocking write - waits until all readers finish
+    #[inline]
+    pub fn write<F>(&self, f: F)
+    where
+        F: FnOnce(&mut T),
+    {
+        loop {
+            let s = self.state.load(Ordering::Acquire);
+            if s == 0 {
+                if self
+                    .state
+                    .compare_exchange(0, -1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            spin_loop();
+        }
+
+        unsafe {
+            f(&mut *self.data.get());
+        }
+
+        self.state.store(0, Ordering::Release);
+    }
 }
 
 impl<T> Deref for ReadGuard<'_, T> {
