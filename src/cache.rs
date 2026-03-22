@@ -1,11 +1,14 @@
-use std::{borrow::Borrow, cell::Cell, hash::Hash, sync::atomic::Ordering};
-
-use crate::spin::rw_r_pre::SpinRwLock;
+use std::{borrow::Borrow, cell::Cell, hash::Hash};
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
 
 #[cfg(feature = "cache_stat")]
 use std::fmt::Display;
 #[cfg(feature = "cache_stat")]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// 全局粗粒度锁，保护所有缓存操作
+static CACHE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 pub trait Cache<K, V> {
     fn get<Q>(&self, hash: u64, q: &Q) -> V
@@ -20,7 +23,7 @@ pub trait Cache<K, V> {
 }
 
 pub struct LockFreeCache<K, V> {
-    entries: Cell<*mut [SpinRwLock<(K, V)>]>,
+    entries: Cell<*mut [(K, V)]>,
     size_exp: Cell<usize>,
     #[cfg(feature = "cache_stat")]
     pub stat: CacheStat,
@@ -30,8 +33,8 @@ impl<K: Default, V: Default> LockFreeCache<K, V> {
     pub fn with_capacity(cap: usize) -> Self {
         let size_exp = cap.isolate_highest_one().trailing_zeros() + 1;
         let entries = (0..(1 << size_exp))
-            .map(|_| SpinRwLock::new(Default::default()))
-            .collect::<Vec<SpinRwLock<(K, V)>>>()
+            .map(|_| Default::default())
+            .collect::<Vec<(K, V)>>()
             .into_boxed_slice();
         LockFreeCache {
             entries: Cell::new(Box::into_raw(entries)),
@@ -47,12 +50,13 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
     where
         Q: Borrow<K> + Hash,
     {
+        let _lock = CACHE_LOCK.lock().unwrap();
         let idx = hash & ((1 << self.size_exp.get()) - 1);
-        let read_guard = unsafe { &*self.entries.get() }[idx as usize].read();
-        if read_guard.0 == *q.borrow() {
+        let entry = &unsafe { &*self.entries.get() }[idx as usize];
+        if entry.0 == *q.borrow() {
             #[cfg(feature = "cache_stat")]
             self.stat.record_hit();
-            return read_guard.1;
+            return entry.1;
         }
 
         #[cfg(feature = "cache_stat")]
@@ -61,33 +65,31 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
     }
 
     fn insert(&self, hash: u64, key: K, value: V) -> bool {
+        let _lock = CACHE_LOCK.lock().unwrap();
         let idx = hash & ((1 << self.size_exp.get()) - 1);
-        let lock = &(unsafe { &*self.entries.get() }[idx as usize]);
-        // blocking write - waits for readers to finish
-        lock.write(|pair| {
-            pair.0 = key;
-            pair.1 = value;
-        });
+        let entry = &mut unsafe { &mut *self.entries.get() }[idx as usize];
+        entry.0 = key;
+        entry.1 = value;
         true
     }
 
     fn invalidate_all(&self) {
-        for entry in (unsafe { &*self.entries.get() }).iter() {
-            let _ = entry.try_write_once(|pair| {
-                pair.0 = Default::default();
-                pair.1 = Default::default();
-            });
+        let _lock = CACHE_LOCK.lock().unwrap();
+        for entry in unsafe { &mut *self.entries.get() }.iter_mut() {
+            entry.0 = Default::default();
+            entry.1 = Default::default();
         }
         #[cfg(feature = "cache_stat")]
         self.stat.record_clear();
     }
 
     fn grow(&self) {
+        let _lock = CACHE_LOCK.lock().unwrap();
         // double the size
         let new_size_exp = self.size_exp.get() + 1;
         let new_entries = (0..(1 << new_size_exp))
-            .map(|_| SpinRwLock::new(Default::default()))
-            .collect::<Vec<SpinRwLock<(K, V)>>>()
+            .map(|_| Default::default())
+            .collect::<Vec<(K, V)>>()
             .into_boxed_slice();
         drop(unsafe { Box::from_raw(self.entries.get()) });
         self.entries.set(Box::into_raw(new_entries));
