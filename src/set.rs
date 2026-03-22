@@ -8,9 +8,6 @@ use std::fmt::Display;
 
 use crate::node::{Node, NodePtr};
 
-// 全局粗粒度锁，保护整个唯一节点表
-static TABLE_LOCK: once_cell::sync::Lazy<Mutex<()>> = once_cell::sync::Lazy::new(|| Mutex::new(()));
-
 #[allow(dead_code)]
 pub trait Set {
     // concurrent operations
@@ -115,6 +112,7 @@ impl Display for TableStatReport {
 }
 
 pub struct LockFreeSet {
+    lock: Mutex<()>,
     buckets: Cell<*mut [AtomicPtr<Node>]>,
     size_exp: Cell<usize>,
     num_marks: Cell<usize>,
@@ -132,6 +130,7 @@ impl LockFreeSet {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         LockFreeSet {
+            lock: Mutex::new(()),
             buckets: Cell::new(Box::into_raw(buckets)),
             size_exp: Cell::new(size_exp as usize),
             num_marks: Cell::new(0),
@@ -272,7 +271,7 @@ impl Set for LockFreeSet {
         let idx = new_ptr.node_hash() & ((1 << self.size_exp.get()) - 1);
 
         // 获取全局粗粒度锁
-        let _lock = TABLE_LOCK.lock().unwrap();
+        let _lock = self.lock.lock().unwrap();
 
         let head = &(unsafe { &*self.buckets.get() })[idx as usize];
         let new_key = unsafe { &*new_ptr }.key();
