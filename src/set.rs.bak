@@ -272,12 +272,18 @@ impl Set for LockFreeSet {
     // ptr 指向的节点是有效的、且当前不在链表中；
     // 用 (level, low, high) 作为“值相等”的判定，并按这个 key 升序插入（保证并发下不会插入重复值：第二个线程 CAS 失败后会重试并看到已存在节点）。
     fn get_or_insert(&self, new_ptr: *mut Node) -> (*mut Node, bool) {
+        #[cfg(feature = "table_stat")]
+        {
+            self.stat.unique_access.fetch_add(1, Ordering::Relaxed);
+        }
         let idx = new_ptr.node_hash() & ((1 << self.size_exp.get()) - 1);
 
         // 获取桶级锁
         let _lock = BUCKET_LOCKS[idx as usize].lock().unwrap();
 
         let head = &(unsafe { &*self.buckets.get() })[idx as usize];
+
+        // 只读一次新节点的 key（要求调用者不会并发修改这些字段）
         let new_key = unsafe { &*new_ptr }.key();
 
         // 在锁保护下遍历链表
@@ -290,12 +296,20 @@ impl Set for LockFreeSet {
 
             match curr_key.cmp(&new_key) {
                 CmpOrd::Equal => {
+                    #[cfg(feature = “table_stat”)]
+                    {
+                        self.stat.unique_hit.fetch_add(1, Ordering::Relaxed);
+                    }
                     return (curr, false);
                 }
                 CmpOrd::Greater => {
                     break;
                 }
                 CmpOrd::Less => {
+                    #[cfg(feature = “table_stat”)]
+                    {
+                        self.stat.unique_chain.fetch_add(1, Ordering::Relaxed);
+                    }
                     prev = &curr_ref.next;
                     curr = prev.load(Ordering::Acquire);
                 }
@@ -311,6 +325,10 @@ impl Set for LockFreeSet {
         let prev_count = self.num_entry.fetch_add(1, Ordering::Relaxed);
         if prev_count + 1 >= 1 << self.size_exp.get() {
             self.needs_gc.store(true, Ordering::Relaxed);
+        }
+        #[cfg(feature = “table_stat”)]
+        {
+            self.stat.unique_miss.fetch_add(1, Ordering::Relaxed);
         }
         (new_ptr, true)
     }
