@@ -8,11 +8,8 @@ use std::fmt::Display;
 
 use crate::node::{Node, NodePtr};
 
-// 桶级锁数组，用于保护每个桶的并发访问
-const MAX_BUCKETS: usize = 1 << 24; // 支持最大 16M 个桶
-static BUCKET_LOCKS: once_cell::sync::Lazy<Vec<Mutex<()>>> = once_cell::sync::Lazy::new(|| {
-    (0..MAX_BUCKETS).map(|_| Mutex::new(())).collect()
-});
+// 全局粗粒度锁，保护整个唯一节点表
+static TABLE_LOCK: once_cell::sync::Lazy<Mutex<()>> = once_cell::sync::Lazy::new(|| Mutex::new(()));
 
 #[allow(dead_code)]
 pub trait Set {
@@ -274,8 +271,8 @@ impl Set for LockFreeSet {
     fn get_or_insert(&self, new_ptr: *mut Node) -> (*mut Node, bool) {
         let idx = new_ptr.node_hash() & ((1 << self.size_exp.get()) - 1);
 
-        // 获取桶级锁
-        let _lock = BUCKET_LOCKS[idx as usize].lock().unwrap();
+        // 获取全局粗粒度锁
+        let _lock = TABLE_LOCK.lock().unwrap();
 
         let head = &(unsafe { &*self.buckets.get() })[idx as usize];
         let new_key = unsafe { &*new_ptr }.key();
