@@ -1,14 +1,10 @@
 use std::{borrow::Borrow, cell::Cell, hash::Hash};
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
 
 #[cfg(feature = "cache_stat")]
 use std::fmt::Display;
 #[cfg(feature = "cache_stat")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-// 全局粗粒度锁，保护所有缓存操作
-static CACHE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 pub trait Cache<K, V> {
     fn get<Q>(&self, hash: u64, q: &Q) -> V
@@ -23,6 +19,7 @@ pub trait Cache<K, V> {
 }
 
 pub struct LockFreeCache<K, V> {
+    lock: Mutex<()>,
     entries: Cell<*mut [(K, V)]>,
     size_exp: Cell<usize>,
     #[cfg(feature = "cache_stat")]
@@ -37,6 +34,7 @@ impl<K: Default, V: Default> LockFreeCache<K, V> {
             .collect::<Vec<(K, V)>>()
             .into_boxed_slice();
         LockFreeCache {
+            lock: Mutex::new(()),
             entries: Cell::new(Box::into_raw(entries)),
             size_exp: Cell::new(size_exp as usize),
             #[cfg(feature = "cache_stat")]
@@ -50,7 +48,7 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
     where
         Q: Borrow<K> + Hash,
     {
-        let _lock = CACHE_LOCK.lock().unwrap();
+        let _lock = self.lock.lock().unwrap();
         let idx = hash & ((1 << self.size_exp.get()) - 1);
         let entry = &unsafe { &*self.entries.get() }[idx as usize];
         if entry.0 == *q.borrow() {
@@ -65,7 +63,7 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
     }
 
     fn insert(&self, hash: u64, key: K, value: V) -> bool {
-        let _lock = CACHE_LOCK.lock().unwrap();
+        let _lock = self.lock.lock().unwrap();
         let idx = hash & ((1 << self.size_exp.get()) - 1);
         let entry = &mut unsafe { &mut *self.entries.get() }[idx as usize];
         entry.0 = key;
@@ -74,7 +72,7 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
     }
 
     fn invalidate_all(&self) {
-        let _lock = CACHE_LOCK.lock().unwrap();
+        let _lock = self.lock.lock().unwrap();
         for entry in unsafe { &mut *self.entries.get() }.iter_mut() {
             entry.0 = Default::default();
             entry.1 = Default::default();
@@ -84,7 +82,7 @@ impl<K: Hash + Eq + Default, V: Default + Copy> Cache<K, V> for LockFreeCache<K,
     }
 
     fn grow(&self) {
-        let _lock = CACHE_LOCK.lock().unwrap();
+        let _lock = self.lock.lock().unwrap();
         // double the size
         let new_size_exp = self.size_exp.get() + 1;
         let new_entries = (0..(1 << new_size_exp))
